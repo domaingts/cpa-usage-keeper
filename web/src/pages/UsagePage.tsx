@@ -14,7 +14,7 @@ import {
   Legend,
   Filler
 } from 'chart.js';
-import { ApiError, fetchStatus, fetchUsageAnalysis, fetchUsageEventFilterOptions, fetchUsageEvents, fetchUsageIdentities, triggerSync } from '@/lib/api';
+import { ApiError, fetchStatus, fetchUsageAnalysis, fetchUsageEventFilterOptions, fetchUsageEvents, fetchUsageIdentities } from '@/lib/api';
 import type { StatusResponse, UsageAnalysisResponse, UsageEvent, UsageIdentity, UsageSourceFilterOption } from '@/lib/types';
 import { Button } from '@/components/ui/Button';
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
@@ -71,20 +71,23 @@ const DEFAULT_CHART_LINES = ['all'];
 const DEFAULT_TIME_RANGE: UsageTimeRange = '8h';
 const DEFAULT_CUSTOM_WINDOW_HOURS = 8;
 const MAX_CHART_LINES = 9;
-const TIME_RANGE_OPTIONS: ReadonlyArray<{ value: Exclude<UsageTimeRange, 'all' | '24h'>; labelKey: string }> = [
+const TIME_RANGE_OPTIONS: ReadonlyArray<{ value: Exclude<UsageTimeRange, 'all'>; labelKey: string }> = [
   { value: '4h', labelKey: 'usage_stats.range_4h' },
   { value: '8h', labelKey: 'usage_stats.range_8h' },
   { value: '12h', labelKey: 'usage_stats.range_12h' },
+  { value: '24h', labelKey: 'usage_stats.range_24h' },
   { value: 'today', labelKey: 'usage_stats.range_today' },
   { value: '7d', labelKey: 'usage_stats.range_7d' },
+  { value: '30d', labelKey: 'usage_stats.range_30d' },
   { value: 'custom', labelKey: 'usage_stats.range_custom' },
 ];
-const HOUR_WINDOW_BY_TIME_RANGE: Record<Extract<UsageTimeRange, '4h' | '8h' | '12h' | '24h' | '7d'>, number> = {
+const HOUR_WINDOW_BY_TIME_RANGE: Record<Extract<UsageTimeRange, '4h' | '8h' | '12h' | '24h' | '7d' | '30d'>, number> = {
   '4h': 4,
   '8h': 8,
   '12h': 12,
   '24h': 24,
-  '7d': 7 * 24
+  '7d': 7 * 24,
+  '30d': 30 * 24
 };
 const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
   { value: 'white', labelKey: 'usage_stats.theme_light' },
@@ -107,6 +110,8 @@ const REQUEST_EVENTS_PAGE_SIZES = [20, 50, 100, 500, 1000] as const;
 const REQUEST_EVENTS_DEFAULT_PAGE_SIZE = 100;
 const ALL_REQUEST_EVENTS_FILTER = '__all__';
 const OVERVIEW_AUTO_REFRESH_INTERVAL_MS = 10_000;
+
+export const shouldShowRangeControls = (tab: UsageTab) => tab !== 'pricing' && tab !== 'credentials';
 
 type RequestEventFilterState = {
   model: string;
@@ -236,7 +241,7 @@ export const sanitizeRequestEventFilters = (
 };
 
 const isUsageTimeRange = (value: unknown): value is UsageTimeRange =>
-  value === '4h' || value === '8h' || value === '12h' || value === '24h' || value === 'today' || value === '7d' || value === 'all' || value === 'custom';
+  value === '4h' || value === '8h' || value === '12h' || value === '24h' || value === 'today' || value === '7d' || value === '30d' || value === 'all' || value === 'custom';
 
 const toDateInputValue = (timestamp: number): string => {
   const date = new Date(timestamp);
@@ -340,7 +345,7 @@ const loadTimeRange = (): UsageTimeRange => {
       return DEFAULT_TIME_RANGE;
     }
     const raw = localStorage.getItem(TIME_RANGE_STORAGE_KEY);
-    if (!isUsageTimeRange(raw) || raw === 'all' || raw === '24h') {
+    if (!isUsageTimeRange(raw) || raw === 'all') {
       return DEFAULT_TIME_RANGE;
     }
     return raw;
@@ -371,6 +376,10 @@ export const getOverviewHourWindowHours = ({ timeRange, filterWindow }: { timeRa
   if (filterWindow.windowMinutes === undefined) return 24;
   return Math.min(Math.max(Math.ceil(filterWindow.windowMinutes / 60), 1), 24);
 };
+
+export const getPreferredOverviewChartPeriod = ({ windowMinutes }: { windowMinutes?: number }): 'hour' | 'day' => (
+  windowMinutes !== undefined && windowMinutes > 24 * 60 ? 'day' : 'hour'
+);
 
 const toTimestampMs = (value: string | undefined): number | undefined => {
   if (!value) return undefined;
@@ -454,9 +463,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   const [eventsResultFilter, setEventsResultFilter] = useState(ALL_REQUEST_EVENTS_FILTER);
   const eventsRequestControllerRef = useRef<AbortController | null>(null);
   const eventsFilterOptionsRequestControllerRef = useRef<AbortController | null>(null);
-  const loadedEventsFilterOptionsKeyRef = useRef('');
   const [manualRefreshLoading, setManualRefreshLoading] = useState(false);
-  const [manualSyncLoading, setManualSyncLoading] = useState(false);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
   const [credentialsError, setCredentialsError] = useState('');
   const [credentialsData, setCredentialsData] = useState<UsageIdentity[]>([]);
@@ -579,6 +586,9 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     fallbackEndMs: lastRefreshedAt?.getTime() ?? Date.now(),
     resolvedRangeEndMs,
   });
+  const preferredOverviewChartPeriod = getPreferredOverviewChartPeriod({
+    windowMinutes: filterWindow.windowMinutes,
+  });
   const isCustomRange = timeRange === 'custom';
 
   const handleChartLinesChange = useCallback((lines: string[]) => {
@@ -684,12 +694,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   }, [customTimeRange.end, customTimeRange.start, timeRange]);
 
   const loadEventFilterOptions = useCallback(async () => {
-    const optionsKey = 'stable';
-
-    if (loadedEventsFilterOptionsKeyRef.current === optionsKey) {
-      return;
-    }
-
     eventsFilterOptionsRequestControllerRef.current?.abort();
     const controller = new AbortController();
     eventsFilterOptionsRequestControllerRef.current = controller;
@@ -701,7 +705,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       }
       setEventsModelOptions(response.models ?? []);
       setEventsSourceOptions(response.sources ?? []);
-      loadedEventsFilterOptionsKeyRef.current = optionsKey;
     } catch (error) {
       if (controller.signal.aborted) {
         return;
@@ -709,7 +712,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       if (eventsFilterOptionsRequestControllerRef.current === controller) {
         setEventsModelOptions([]);
         setEventsSourceOptions([]);
-        loadedEventsFilterOptionsKeyRef.current = '';
       }
       if (error instanceof ApiError && error.status === 401) {
         onAuthRequired?.();
@@ -874,27 +876,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     }
   }, [onAuthRequired, refreshActiveTab, t]);
 
-  const handleManualSync = useCallback(async () => {
-    setManualSyncLoading(true);
-    try {
-      await syncCpaData({
-        triggerBackendSync: triggerSync,
-        refreshActiveTab,
-        refreshStatus: fetchStatus,
-        onStatus: setStatus,
-      });
-      setStatusError('');
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        onAuthRequired?.();
-        return;
-      }
-      setStatusError(error instanceof Error ? error.message : t('notification.refresh_failed'));
-    } finally {
-      setManualSyncLoading(false);
-    }
-  }, [onAuthRequired, refreshActiveTab, t]);
-
   useEffect(() => scheduleOverviewAutoRefresh({
     enabled: isOverviewTab,
     refreshOverview: loadUsage,
@@ -987,7 +968,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     const parsed = new Date(status.last_run_at);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }, [status?.last_run_at]);
-  const showRangeControls = activeTab !== 'pricing';
+  const showRangeControls = shouldShowRangeControls(activeTab);
   const {
     requestsSparkline,
     tokensSparkline,
@@ -1005,7 +986,15 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     tokensChartData,
     requestsChartOptions,
     tokensChartOptions
-  } = useChartData({ usage, chartLines, isDark, isMobile, hourWindowHours, endMs: filterWindowEndMs });
+  } = useChartData({
+    usage,
+    chartLines,
+    isDark,
+    isMobile,
+    hourWindowHours,
+    endMs: filterWindowEndMs,
+    preferredPeriod: preferredOverviewChartPeriod,
+  });
 
   const overviewModelNames = useMemo(
     () => getModelNamesFromUsage(usage?.usage ?? null),
@@ -1120,17 +1109,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                 );
               })}
             </div>
-            <div className={styles.syncSwitcher} role="group" aria-label={t('usage_stats.sync_now')}>
-              <button
-                type="button"
-                className={styles.syncPill}
-                onClick={() => void handleManualSync()}
-                disabled={manualSyncLoading}
-                title={t('usage_stats.sync_now')}
-              >
-                {manualSyncLoading ? t('common.loading') : t('usage_stats.sync_now')}
-              </button>
-            </div>
           </div>
         </header>
 
@@ -1171,7 +1149,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
 
               <div className={styles.toolbarActionsRight}>
                 <div
-                  className={`${styles.timeRangeGroup} ${showRangeControls ? '' : styles.timeRangeGroupCollapsed}`.trim()}
+                  className={`${styles.timeRangeGroup} ${!showRangeControls ? styles.timeRangeGroupCollapsed : ''}`.trim()}
                   aria-hidden={!showRangeControls}
                 >
                   <span className={styles.timeRangeLabel}>{t('usage_stats.range_filter')}</span>
@@ -1182,10 +1160,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                     className={styles.timeRangeSelectControl}
                     ariaLabel={t('usage_stats.range_filter')}
                     fullWidth={false}
+                    disabled={!showRangeControls}
                   />
                   <div
-                    className={`${styles.customRangeInline} ${isCustomRange ? styles.customRangeInlineOpen : ''}`.trim()}
-                    aria-hidden={!isCustomRange}
+                    className={`${styles.customRangeInline} ${showRangeControls && isCustomRange ? styles.customRangeInlineOpen : ''}`.trim()}
+                    aria-hidden={!showRangeControls || !isCustomRange}
                   >
                     <div className={styles.customRangeFields}>
                       <label className={styles.customRangeField}>
@@ -1201,7 +1180,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                             }))
                           }
                           aria-label={t('usage_stats.custom_start')}
-                          disabled={!isCustomRange}
+                          disabled={!showRangeControls || !isCustomRange}
                         />
                       </label>
                       <span className={styles.customRangeSeparator} aria-hidden="true">—</span>
@@ -1218,7 +1197,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                             }))
                           }
                           aria-label={t('usage_stats.custom_end')}
-                          disabled={!isCustomRange}
+                          disabled={!showRangeControls || !isCustomRange}
                         />
                       </label>
                     </div>
@@ -1301,6 +1280,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                   isMobile={isMobile}
                   hourWindowHours={hourWindowHours}
                   endMs={filterWindowEndMs}
+                  preferredPeriod={preferredOverviewChartPeriod}
                 />
 
                 <CostTrendChart
@@ -1310,6 +1290,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                   isMobile={isMobile}
                   hourWindowHours={hourWindowHours}
                   endMs={filterWindowEndMs}
+                  preferredPeriod={preferredOverviewChartPeriod}
                 />
               </>
             )}

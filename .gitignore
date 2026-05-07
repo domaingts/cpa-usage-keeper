@@ -23,6 +23,9 @@ web/node_modules/
 web/dist/
 web/dist-ssr/
 
+# local build caches
+.m2/
+
 # logs
 logs/
 *.log
