@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import './index.css';
 import { ApiError, getSession, login } from './lib/api';
 import { LoginPage } from './pages/LoginPage';
 import { UsagePage } from './pages/UsagePage';
