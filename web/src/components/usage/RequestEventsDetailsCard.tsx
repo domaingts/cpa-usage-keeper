@@ -313,6 +313,7 @@ export function RequestEventsDetailsCard({
           <Button
             variant="ghost"
             size="sm"
+            className={styles.usagePillAction}
             onClick={handleClearFilters}
             disabled={!hasActiveFilters}
           >
@@ -331,7 +332,7 @@ export function RequestEventsDetailsCard({
               value={effectiveModelFilter}
               options={modelOptions}
               onChange={onModelFilterChange}
-              className={styles.requestEventsSelect}
+              className={`${styles.requestEventsSelect} ${styles.usagePillControl}`}
               ariaLabel={t('usage_stats.request_events_filter_model')}
               fullWidth={false}
             />
@@ -344,7 +345,7 @@ export function RequestEventsDetailsCard({
               value={effectiveSourceFilter}
               options={sourceOptions}
               onChange={onSourceFilterChange}
-              className={styles.requestEventsSelect}
+              className={`${styles.requestEventsSelect} ${styles.usagePillControl}`}
               ariaLabel={t('usage_stats.request_events_filter_source')}
               fullWidth={false}
             />
@@ -357,7 +358,7 @@ export function RequestEventsDetailsCard({
               value={effectiveResultFilter}
               options={resultOptions}
               onChange={onResultFilterChange}
-              className={styles.requestEventsResultSelect}
+              className={`${styles.requestEventsResultSelect} ${styles.usagePillControl}`}
               ariaLabel={t('usage_stats.request_events_filter_result')}
               fullWidth={false}
             />
@@ -371,7 +372,7 @@ export function RequestEventsDetailsCard({
               value={String(pageSize)}
               options={pageSizeSelectOptions}
               onChange={(value) => onPageSizeChange(Number(value))}
-              className={`${styles.requestEventsPageSizeSelect} ${styles.requestEventsPageSizeSelectCompact}`}
+              className={`${styles.requestEventsPageSizeSelect} ${styles.requestEventsPageSizeSelectCompact} ${styles.usagePillControl}`}
               ariaLabel={`${t('usage_stats.request_events_rows_per_page')}: ${pageSizeOptions.join(', ')}`}
               fullWidth={false}
               disabled={loading}
@@ -379,10 +380,10 @@ export function RequestEventsDetailsCard({
           </div>
           <div className={styles.requestEventsPaginationItem}>
             <span className={styles.requestEventsFilterLabel}>{pageLabel}</span>
-            <div className={styles.requestEventsPagerControls}>
+            <div className={`${styles.requestEventsPagerControls} ${styles.usagePillShell}`}>
               <button
                 type="button"
-                className={styles.requestEventsPagerButton}
+                className={`${styles.requestEventsPagerButton} ${styles.usagePillAction}`}
                 onClick={() => onPageChange(page - 1)}
                 disabled={loading || safePage <= 1}
               >
@@ -390,7 +391,7 @@ export function RequestEventsDetailsCard({
               </button>
               <button
                 type="button"
-                className={styles.requestEventsPagerButton}
+                className={`${styles.requestEventsPagerButton} ${styles.usagePillAction}`}
                 onClick={() => onPageChange(page + 1)}
                 disabled={loading || safeTotalPages === 0 || safePage >= safeTotalPages}
               >
