@@ -1,15 +1,19 @@
 package repository
 
 import (
+	"context"
 	"cpa-usage-keeper/internal/repository/dto"
 	"math"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"cpa-usage-keeper/internal/config"
 	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/timeutil"
+	"gorm.io/gorm"
 )
 
 func withRepositoryTestLocation(t *testing.T, name string) {
@@ -23,7 +27,22 @@ func withRepositoryTestLocation(t *testing.T, name string) {
 	time.Local = location
 }
 
+func buildUsageOverviewFromEventsForTest(events []entities.UsageEvent, filter dto.UsageQueryFilter, pricingByModel map[string]entities.ModelPriceSetting) *dto.UsageOverviewRecord {
+	windowMinutes := computeWindowMinutes(filter)
+	bucketByDay := shouldBucketUsageOverviewByDay(filter, windowMinutes)
+	latestHourlyStart := latestHourlySeriesStart(filter)
+	overview := newUsageOverviewRecord(filter, windowMinutes)
+	for _, event := range events {
+		applyUsageEventToSnapshot(overview.Usage, event, false)
+		applyUsageEventToOverview(overview, event, bucketByDay, latestHourlyStart, pricingByModel)
+	}
+	finalizeUsageOverview(overview, false)
+	return overview
+}
+
 func TestBuildUsageSnapshotWithFilterAppliesTimeBounds(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
 	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-filter.db")})
 	if err != nil {
 		t.Fatalf("OpenDatabase returned error: %v", err)
@@ -55,15 +74,538 @@ func TestBuildUsageSnapshotWithFilterAppliesTimeBounds(t *testing.T) {
 	if len(snapshot.APIs) != 1 {
 		t.Fatalf("expected one API in filtered snapshot, got %+v", snapshot.APIs)
 	}
-	if snapshot.RequestsByHour["2026-04-16T10:00:00Z"] != 1 {
-		t.Fatalf("expected only 10:00 bucket to remain, got %+v", snapshot.RequestsByHour)
+	if snapshot.RequestsByHour["2026-04-16T18:00:00+08:00"] != 1 {
+		t.Fatalf("expected only 18:00 project-time bucket to remain, got %+v", snapshot.RequestsByHour)
 	}
-	if _, ok := snapshot.RequestsByHour["2026-04-16T09:00:00Z"]; ok {
-		t.Fatalf("expected 09:00 bucket to be filtered out, got %+v", snapshot.RequestsByHour)
+	if _, ok := snapshot.RequestsByHour["2026-04-16T17:00:00+08:00"]; ok {
+		t.Fatalf("expected 17:00 project-time bucket to be filtered out, got %+v", snapshot.RequestsByHour)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterRequiresResolvedTimeRange(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-requires-time-range.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	if _, err := BuildUsageOverviewWithFilter(db, dto.UsageQueryFilter{Range: "4h"}); err == nil || !strings.Contains(err.Error(), "requires start_time and end_time") {
+		t.Fatalf("expected missing resolved time range error, got %v", err)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterDoesNotRunAggregationCatchup(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-no-query-catchup.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	events := []entities.UsageEvent{
+		{EventKey: "event-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 10, 0, 0, time.UTC), InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+	}
+	if _, _, err := InsertUsageEvents(db, events); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+
+	start := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 11, 0, 0, 0, time.UTC)
+	if _, err := BuildUsageOverviewWithFilter(db, dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}); err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+
+	var checkpointCount int64
+	if err := db.Model(&entities.UsageOverviewAggregationCheckpoint{}).Count(&checkpointCount).Error; err != nil {
+		t.Fatalf("count overview checkpoints returned error: %v", err)
+	}
+	if checkpointCount != 0 {
+		t.Fatalf("expected overview query not to create aggregation checkpoint, got %d", checkpointCount)
+	}
+}
+
+func TestLoadUsageOverviewBoundaryEventsUsesSeparateRangeQueries(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-boundary-sql.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	start := time.Date(2026, 4, 16, 9, 20, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 12, 40, 0, 0, time.UTC)
+	fullStart := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	fullEnd := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}
+	var sqls []string
+	callbackName := "test:capture_boundary_sql"
+	if err := db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		sqls = append(sqls, tx.Statement.SQL.String())
+	}); err != nil {
+		t.Fatalf("register query callback returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+	if _, err := loadUsageOverviewBoundaryEventsWithFilter(db, filter, fullStart, fullEnd); err != nil {
+		t.Fatalf("loadUsageOverviewBoundaryEventsWithFilter returned error: %v", err)
+	}
+	if len(sqls) != 2 {
+		t.Fatalf("expected two boundary range queries, got %d: %+v", len(sqls), sqls)
+	}
+	for _, sql := range sqls {
+		if strings.Contains(strings.ToUpper(sql), " OR ") {
+			t.Fatalf("expected boundary event query not to contain OR, got %s", sql)
+		}
+	}
+}
+
+func TestBuildUsageOverviewWithFilterIncludesHealthBoundaryInsideFullHour(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-health-inner-boundary.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	start := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	for start.Truncate(usageOverviewHealthPresetSpan).Equal(start) {
+		start = start.Add(time.Hour)
+	}
+	end := start.Add(2 * time.Hour)
+	boundaryEventTime := start.Add(time.Second)
+	if _, _, err := InsertUsageEvents(db, []entities.UsageEvent{
+		{EventKey: "health-edge", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: boundaryEventTime, TotalTokens: 10},
+	}); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, end.Add(time.Hour)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
+
+	overview, err := BuildUsageOverviewWithFilter(db, dto.UsageQueryFilter{Range: "4h", StartTime: &start, EndTime: &end})
+	if err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+	blockIndex := usageOverviewHealthBlockIndex(overview.Health.BlockDetails, boundaryEventTime)
+	if blockIndex < 0 {
+		t.Fatalf("expected boundary event to fall inside health grid")
+	}
+	block := overview.Health.BlockDetails[blockIndex]
+	if block.Success != 1 || block.Rate != 1 {
+		t.Fatalf("expected health boundary event inside full hour to update block, got %+v", block)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterReusesBoundaryEventsForHealth(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-reuse-boundaries.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	start := time.Date(2026, 4, 16, 9, 20, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 12, 40, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}
+	var usageEventQueries []string
+	callbackName := "test:capture_overview_usage_event_sql"
+	if err := db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		sql := tx.Statement.SQL.String()
+		if strings.Contains(sql, "FROM `usage_events`") || strings.Contains(sql, "FROM \"usage_events\"") {
+			usageEventQueries = append(usageEventQueries, sql)
+		}
+	}); err != nil {
+		t.Fatalf("register query callback returned error: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+	if _, err := BuildUsageOverviewWithFilter(db, filter); err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+	if len(usageEventQueries) != 2 {
+		t.Fatalf("expected only the two main boundary usage_events queries, got %d: %+v", len(usageEventQueries), usageEventQueries)
+	}
+	for _, sql := range usageEventQueries {
+		if strings.Contains(strings.ToUpper(sql), " OR ") {
+			t.Fatalf("expected reused boundary event query not to contain OR, got %s", sql)
+		}
+	}
+}
+
+func TestBuildUsageOverviewWithFilterKeepsRawEventQueriesAtBoundaries(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	end := time.Date(2026, 5, 15, 1, 40, 17, 271676179, time.Local)
+	cases := []struct {
+		name       string
+		rangeValue string
+		start      time.Time
+		end        time.Time
+	}{
+		{name: "4h", rangeValue: "4h", start: end.Add(-4 * time.Hour), end: end},
+		{name: "8h", rangeValue: "8h", start: end.Add(-8 * time.Hour), end: end},
+		{name: "12h", rangeValue: "12h", start: end.Add(-12 * time.Hour), end: end},
+		{name: "24h", rangeValue: "24h", start: end.Add(-24 * time.Hour), end: end},
+		{name: "today", rangeValue: "today", start: time.Date(2026, 5, 15, 0, 0, 0, 0, time.Local), end: end},
+		{name: "yesterday", rangeValue: "yesterday", start: time.Date(2026, 5, 14, 0, 0, 0, 0, time.Local), end: time.Date(2026, 5, 14, 23, 59, 59, 0, time.Local)},
+		{name: "7d", rangeValue: "7d", start: end.AddDate(0, 0, -7), end: end},
+		{name: "30d", rangeValue: "30d", start: end.AddDate(0, 0, -30), end: end},
+		{name: "custom-long", rangeValue: "custom", start: end.AddDate(0, 0, -30), end: end},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-boundary-sql.db")})
+			if err != nil {
+				t.Fatalf("OpenDatabase returned error: %v", err)
+			}
+			closeTestDatabase(t, db)
+
+			filter := dto.UsageQueryFilter{Range: tc.rangeValue, StartTime: &tc.start, EndTime: &tc.end}
+			var ranges []usageEventQueryRange
+			callbackName := "test:capture_overview_usage_event_sql_" + tc.name
+			if err := db.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				sql := tx.Statement.SQL.String()
+				if strings.Contains(sql, "FROM `usage_events`") || strings.Contains(sql, "FROM \"usage_events\"") {
+					ranges = append(ranges, usageEventQueryRangesFromVars(t, tx.Statement.Vars)...)
+				}
+			}); err != nil {
+				t.Fatalf("register query callback returned error: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Callback().Query().Remove(callbackName) })
+
+			if _, err := BuildUsageOverviewWithFilter(db, filter); err != nil {
+				t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+			}
+			if len(ranges) == 0 {
+				t.Fatalf("expected raw usage_events boundary queries to be captured")
+			}
+			for _, queryRange := range ranges {
+				if queryRange.end.Sub(queryRange.start) > time.Hour {
+					t.Fatalf("expected overview raw usage_events query to stay near bucket boundaries, got %s to %s", queryRange.start, queryRange.end)
+				}
+			}
+		})
+	}
+}
+
+type usageEventQueryRange struct {
+	start time.Time
+	end   time.Time
+}
+
+func usageEventQueryRangesFromVars(t *testing.T, vars []any) []usageEventQueryRange {
+	t.Helper()
+	ranges := make([]usageEventQueryRange, 0)
+	for i := 0; i+1 < len(vars); i++ {
+		start, startOK := usageEventQueryTime(vars[i])
+		end, endOK := usageEventQueryTime(vars[i+1])
+		if startOK && endOK && end.After(start) {
+			ranges = append(ranges, usageEventQueryRange{start: start, end: end})
+		}
+	}
+	return ranges
+}
+
+func usageEventQueryTime(value any) (time.Time, bool) {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed, true
+	case string:
+		parsed, err := time.Parse(time.RFC3339Nano, typed)
+		return parsed, err == nil
+	default:
+		return time.Time{}, false
+	}
+}
+
+func TestBuildUsageOverviewWithFilterUsesStatsForFullHoursAndRawEventsForBoundaries(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-stats-backed.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	if _, err := UpsertModelPriceSetting(db, dto.ModelPriceSettingInput{
+		Model:                "claude-sonnet",
+		PromptPricePer1M:     0,
+		CompletionPricePer1M: 0,
+		CachePricePer1M:      0,
+	}); err != nil {
+		t.Fatalf("UpsertModelPriceSetting returned error: %v", err)
+	}
+
+	events := []entities.UsageEvent{
+		{EventKey: "outside-before", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 10, 0, 0, time.UTC), InputTokens: 99, OutputTokens: 99, TotalTokens: 198},
+		{EventKey: "start-boundary", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 25, 0, 0, time.UTC), InputTokens: 1000, OutputTokens: 500, ReasoningTokens: 100, CachedTokens: 200, TotalTokens: 1800},
+		{EventKey: "full-hour-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 10, 0, 0, time.UTC), InputTokens: 2000, OutputTokens: 1000, ReasoningTokens: 50, CachedTokens: 100, TotalTokens: 3150},
+		{EventKey: "full-hour-2", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 50, 0, 0, time.UTC), Failed: true, InputTokens: 500, OutputTokens: 250, ReasoningTokens: 25, CachedTokens: 50, TotalTokens: 825},
+		{EventKey: "full-hour-3", APIGroupKey: "provider-b", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 11, 30, 0, 0, time.UTC), InputTokens: 700, OutputTokens: 300, ReasoningTokens: 30, CachedTokens: 70, TotalTokens: 1100},
+		{EventKey: "end-boundary", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 12, 35, 0, 0, time.UTC), InputTokens: 400, OutputTokens: 200, ReasoningTokens: 20, CachedTokens: 40, TotalTokens: 660},
+		{EventKey: "outside-after", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 12, 45, 0, 0, time.UTC), InputTokens: 88, OutputTokens: 88, TotalTokens: 176},
+	}
+	if _, _, err := InsertUsageEvents(db, events); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 16, 13, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
+
+	start := time.Date(2026, 4, 16, 9, 20, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 12, 40, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}
+	pricingByModel, err := loadPriceSettingsByModel(db)
+	if err != nil {
+		t.Fatalf("loadPriceSettingsByModel returned error: %v", err)
+	}
+	oracleEvents, err := loadUsageOverviewEventsWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("loadUsageOverviewEventsWithFilter returned error: %v", err)
+	}
+	oracle := buildUsageOverviewFromEventsForTest(oracleEvents, filter, pricingByModel)
+
+	fullHourStart := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	fullHourEnd := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	if err := db.Where("timestamp >= ? AND timestamp < ?", timeutil.FormatStorageTime(fullHourStart), timeutil.FormatStorageTime(fullHourEnd)).Delete(&entities.UsageEvent{}).Error; err != nil {
+		t.Fatalf("delete full-hour usage_events returned error: %v", err)
+	}
+
+	overview, err := BuildUsageOverviewWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(overview.Summary, oracle.Summary) {
+		t.Fatalf("summary mismatch after full-hour raw events were removed\ngot:  %+v\nwant: %+v", overview.Summary, oracle.Summary)
+	}
+	if !reflect.DeepEqual(overview.Usage, oracle.Usage) {
+		t.Fatalf("usage snapshot mismatch after full-hour raw events were removed\ngot:  %+v\nwant: %+v", overview.Usage, oracle.Usage)
+	}
+	if !reflect.DeepEqual(overview.Series, oracle.Series) {
+		t.Fatalf("series mismatch after full-hour raw events were removed\ngot:  %+v\nwant: %+v", overview.Series, oracle.Series)
+	}
+	if !reflect.DeepEqual(overview.HourlySeries, oracle.HourlySeries) {
+		t.Fatalf("hourly series mismatch after full-hour raw events were removed\ngot:  %+v\nwant: %+v", overview.HourlySeries, oracle.HourlySeries)
+	}
+	if !reflect.DeepEqual(overview.DailySeries, oracle.DailySeries) {
+		t.Fatalf("daily series mismatch after full-hour raw events were removed\ngot:  %+v\nwant: %+v", overview.DailySeries, oracle.DailySeries)
+	}
+	if !reflect.DeepEqual(overview.Health, oracle.Health) {
+		t.Fatalf("health mismatch after full-hour raw events were removed\ngot:  %+v\nwant: %+v", overview.Health, oracle.Health)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterKeepsHealthWindowExactAtStatsBoundaries(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-health-boundary.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	events := []entities.UsageEvent{
+		{EventKey: "outside-health-bucket", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 19, 30, 0, time.UTC), Failed: true, TotalTokens: 10},
+		{EventKey: "inside-health-bucket", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 20, 30, 0, time.UTC), Failed: false, TotalTokens: 20},
+		{EventKey: "full-hour", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 10, 0, 0, time.UTC), Failed: false, TotalTokens: 30},
+	}
+	if _, _, err := InsertUsageEvents(db, events); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 16, 11, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
+
+	start := time.Date(2026, 4, 16, 9, 20, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 10, 30, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}
+	pricingByModel, err := loadPriceSettingsByModel(db)
+	if err != nil {
+		t.Fatalf("loadPriceSettingsByModel returned error: %v", err)
+	}
+	oracleEvents, err := loadUsageOverviewEventsWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("loadUsageOverviewEventsWithFilter returned error: %v", err)
+	}
+	oracle := buildUsageOverviewFromEventsForTest(oracleEvents, filter, pricingByModel)
+
+	overview, err := BuildUsageOverviewWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(overview.Health, oracle.Health) {
+		t.Fatalf("health mismatch for non-aligned stats window\ngot:  %+v\nwant: %+v", overview.Health, oracle.Health)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterKeepsHourlyBucketsWhenShortWindowContainsCompleteDay(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-short-complete-day.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	events := []entities.UsageEvent{
+		{EventKey: "hour-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 2, 0, 0, 0, time.UTC), TotalTokens: 10},
+		{EventKey: "hour-2", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 15, 30, 0, 0, time.UTC), TotalTokens: 20},
+	}
+	if _, _, err := InsertUsageEvents(db, events); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
+
+	start := time.Date(2026, 4, 15, 15, 30, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 16, 30, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}
+	pricingByModel, err := loadPriceSettingsByModel(db)
+	if err != nil {
+		t.Fatalf("loadPriceSettingsByModel returned error: %v", err)
+	}
+	oracleEvents, err := loadUsageOverviewEventsWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("loadUsageOverviewEventsWithFilter returned error: %v", err)
+	}
+	oracle := buildUsageOverviewFromEventsForTest(oracleEvents, filter, pricingByModel)
+
+	overview, err := BuildUsageOverviewWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(overview.Series, oracle.Series) {
+		t.Fatalf("series mismatch for short window with complete day\ngot:  %+v\nwant: %+v", overview.Series, oracle.Series)
+	}
+	if !reflect.DeepEqual(overview.Usage.RequestsByHour, oracle.Usage.RequestsByHour) {
+		t.Fatalf("snapshot hourly requests mismatch\ngot:  %+v\nwant: %+v", overview.Usage.RequestsByHour, oracle.Usage.RequestsByHour)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterKeepsHealthTotalsForFullQueryWindow(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-health-totals.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	events := []entities.UsageEvent{
+		{EventKey: "old-success", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC), TotalTokens: 10},
+		{EventKey: "recent-failure", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC), Failed: true, TotalTokens: 20},
+	}
+	if _, _, err := InsertUsageEvents(db, events); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
+
+	start := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 30, 0, 0, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "30d", StartTime: &start, EndTime: &end}
+	pricingByModel, err := loadPriceSettingsByModel(db)
+	if err != nil {
+		t.Fatalf("loadPriceSettingsByModel returned error: %v", err)
+	}
+	oracleEvents, err := loadUsageOverviewEventsWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("loadUsageOverviewEventsWithFilter returned error: %v", err)
+	}
+	oracle := buildUsageOverviewFromEventsForTest(oracleEvents, filter, pricingByModel)
+
+	overview, err := BuildUsageOverviewWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+
+	if overview.Health.TotalSuccess != oracle.Health.TotalSuccess || overview.Health.TotalFailure != oracle.Health.TotalFailure || overview.Health.SuccessRate != oracle.Health.SuccessRate {
+		t.Fatalf("health totals mismatch for full query window\ngot:  %+v\nwant: %+v", overview.Health, oracle.Health)
+	}
+}
+
+func TestBuildUsageOverviewWithFilterUsesDailyStatsForCompleteDays(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
+	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-daily-stats-backed.db")})
+	if err != nil {
+		t.Fatalf("OpenDatabase returned error: %v", err)
+	}
+	closeTestDatabase(t, db)
+
+	if _, err := UpsertModelPriceSetting(db, dto.ModelPriceSettingInput{
+		Model:                "claude-sonnet",
+		PromptPricePer1M:     0,
+		CompletionPricePer1M: 0,
+		CachePricePer1M:      0,
+	}); err != nil {
+		t.Fatalf("UpsertModelPriceSetting returned error: %v", err)
+	}
+
+	events := []entities.UsageEvent{
+		{EventKey: "start-boundary", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 15, 15, 40, 0, 0, time.UTC), InputTokens: 100, OutputTokens: 50, TotalTokens: 150},
+		{EventKey: "full-day-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 2, 0, 0, 0, time.UTC), InputTokens: 200, OutputTokens: 100, CachedTokens: 25, TotalTokens: 325},
+		{EventKey: "full-day-2", APIGroupKey: "provider-b", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 15, 30, 0, 0, time.UTC), Failed: true, InputTokens: 300, OutputTokens: 150, ReasoningTokens: 40, TotalTokens: 490},
+		{EventKey: "end-boundary", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 24, 16, 30, 0, 0, time.UTC), InputTokens: 400, OutputTokens: 200, TotalTokens: 600},
+	}
+	if _, _, err := InsertUsageEvents(db, events); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 16, 18, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
+
+	start := time.Date(2026, 4, 15, 15, 30, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 24, 17, 30, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{Range: "custom", StartTime: &start, EndTime: &end}
+	pricingByModel, err := loadPriceSettingsByModel(db)
+	if err != nil {
+		t.Fatalf("loadPriceSettingsByModel returned error: %v", err)
+	}
+	oracleEvents, err := loadUsageOverviewEventsWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("loadUsageOverviewEventsWithFilter returned error: %v", err)
+	}
+	oracle := buildUsageOverviewFromEventsForTest(oracleEvents, filter, pricingByModel)
+
+	fullDayStart := time.Date(2026, 4, 16, 0, 0, 0, 0, time.Local)
+	fullDayEnd := fullDayStart.Add(24 * time.Hour)
+	if err := db.Where("timestamp >= ? AND timestamp < ?", timeutil.FormatStorageTime(fullDayStart), timeutil.FormatStorageTime(fullDayEnd)).Delete(&entities.UsageEvent{}).Error; err != nil {
+		t.Fatalf("delete full-day usage_events returned error: %v", err)
+	}
+	overview, err := BuildUsageOverviewWithFilter(db, filter)
+	if err != nil {
+		t.Fatalf("BuildUsageOverviewWithFilter returned error: %v", err)
+	}
+
+	if !reflect.DeepEqual(overview.Summary, oracle.Summary) {
+		t.Fatalf("summary mismatch after full-day hourly/raw data were removed\ngot:  %+v\nwant: %+v", overview.Summary, oracle.Summary)
+	}
+	if !reflect.DeepEqual(overview.Series, oracle.Series) {
+		t.Fatalf("series mismatch after full-day hourly/raw data were removed\ngot:  %+v\nwant: %+v", overview.Series, oracle.Series)
+	}
+	if !reflect.DeepEqual(overview.DailySeries, oracle.DailySeries) {
+		t.Fatalf("daily series mismatch after full-day hourly/raw data were removed\ngot:  %+v\nwant: %+v", overview.DailySeries, oracle.DailySeries)
+	}
+	if !reflect.DeepEqual(overview.Usage.RequestsByHour, oracle.Usage.RequestsByHour) || !reflect.DeepEqual(overview.Usage.TokensByHour, oracle.Usage.TokensByHour) {
+		t.Fatalf("snapshot hourly maps mismatch after full-day raw data were removed\ngot:  %+v/%+v\nwant: %+v/%+v", overview.Usage.RequestsByHour, overview.Usage.TokensByHour, oracle.Usage.RequestsByHour, oracle.Usage.TokensByHour)
 	}
 }
 
 func TestBuildUsageOverviewWithFilterComputesSummaryAndSeries(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
 	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview.db")})
 	if err != nil {
 		t.Fatalf("OpenDatabase returned error: %v", err)
@@ -98,6 +640,9 @@ func TestBuildUsageOverviewWithFilterComputesSummaryAndSeries(t *testing.T) {
 	}
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
 	}
 
 	start := time.Date(2026, 4, 16, 0, 0, 0, 0, time.UTC)
@@ -163,40 +708,43 @@ func TestBuildUsageOverviewWithFilterComputesSummaryAndSeries(t *testing.T) {
 	if overview.Health.Rows != 7 || overview.Health.Columns != 96 || overview.Health.BucketSeconds != 15*60 {
 		t.Fatalf("unexpected service health grid metadata: %+v", overview.Health)
 	}
-	if overview.Health.WindowStart != time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC) ||
-		overview.Health.WindowEnd != time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC) {
+	location := time.Local
+	if overview.Health.WindowStart != time.Date(2026, 4, 11, 8, 0, 0, 0, location) ||
+		overview.Health.WindowEnd != time.Date(2026, 4, 18, 8, 0, 0, 0, location) {
 		t.Fatalf("unexpected service health window: %+v", overview.Health)
 	}
 	if len(overview.Health.BlockDetails) != overview.Health.Rows*overview.Health.Columns {
 		t.Fatalf("expected full service health grid, got %d blocks", len(overview.Health.BlockDetails))
 	}
 	firstBlock := overview.Health.BlockDetails[0]
-	if firstBlock.StartTime != time.Date(2026, 4, 11, 0, 0, 0, 0, time.UTC) ||
-		firstBlock.EndTime != time.Date(2026, 4, 11, 0, 15, 0, 0, time.UTC) ||
+	if firstBlock.StartTime != time.Date(2026, 4, 11, 8, 0, 0, 0, location) ||
+		firstBlock.EndTime != time.Date(2026, 4, 11, 8, 15, 0, 0, location) ||
 		firstBlock.Success != 0 || firstBlock.Failure != 0 || firstBlock.Rate != -1 {
 		t.Fatalf("unexpected first health block: %+v", firstBlock)
 	}
 	populatedBlock := overview.Health.BlockDetails[517]
-	if populatedBlock.StartTime != time.Date(2026, 4, 16, 9, 15, 0, 0, time.UTC) ||
-		populatedBlock.EndTime != time.Date(2026, 4, 16, 9, 30, 0, 0, time.UTC) ||
+	if populatedBlock.StartTime != time.Date(2026, 4, 16, 17, 15, 0, 0, location) ||
+		populatedBlock.EndTime != time.Date(2026, 4, 16, 17, 30, 0, 0, location) ||
 		populatedBlock.Success != 1 || populatedBlock.Failure != 0 || populatedBlock.Rate != 1 {
 		t.Fatalf("unexpected populated health block: %+v", populatedBlock)
 	}
 	failedBlock := overview.Health.BlockDetails[523]
-	if failedBlock.StartTime != time.Date(2026, 4, 16, 10, 45, 0, 0, time.UTC) ||
-		failedBlock.EndTime != time.Date(2026, 4, 16, 11, 0, 0, 0, time.UTC) ||
+	if failedBlock.StartTime != time.Date(2026, 4, 16, 18, 45, 0, 0, location) ||
+		failedBlock.EndTime != time.Date(2026, 4, 16, 19, 0, 0, 0, location) ||
 		failedBlock.Success != 0 || failedBlock.Failure != 1 || failedBlock.Rate != 0 {
 		t.Fatalf("unexpected failed health block: %+v", failedBlock)
 	}
 	latestPopulatedBlock := overview.Health.BlockDetails[620]
-	if latestPopulatedBlock.StartTime != time.Date(2026, 4, 17, 11, 0, 0, 0, time.UTC) ||
-		latestPopulatedBlock.EndTime != time.Date(2026, 4, 17, 11, 15, 0, 0, time.UTC) ||
+	if latestPopulatedBlock.StartTime != time.Date(2026, 4, 17, 19, 0, 0, 0, location) ||
+		latestPopulatedBlock.EndTime != time.Date(2026, 4, 17, 19, 15, 0, 0, location) ||
 		latestPopulatedBlock.Success != 1 || latestPopulatedBlock.Failure != 0 || latestPopulatedBlock.Rate != 1 {
 		t.Fatalf("unexpected latest populated health block: %+v", latestPopulatedBlock)
 	}
 }
 
 func TestBuildUsageOverviewFromEventsBuildsSnapshotAndOverviewInOnePass(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
 	events := []entities.UsageEvent{
 		{
 			EventKey: "event-1", APIGroupKey: "provider-a", Model: "claude-sonnet",
@@ -223,7 +771,7 @@ func TestBuildUsageOverviewFromEventsBuildsSnapshotAndOverviewInOnePass(t *testi
 		},
 	}
 
-	overview := buildUsageOverviewFromEvents(events, filter, pricingByModel)
+	overview := buildUsageOverviewFromEventsForTest(events, filter, pricingByModel)
 
 	if overview.Usage == nil {
 		t.Fatal("expected usage snapshot to be populated")
@@ -255,13 +803,13 @@ func TestBuildUsageOverviewFromEventsBuildsSnapshotAndOverviewInOnePass(t *testi
 	if overview.Summary.CostAvailable {
 		t.Fatalf("expected cost to be unavailable when any event model with billable tokens is unpriced, got %+v", overview.Summary)
 	}
-	if overview.Series.Requests["2026-04-16T09:00:00Z"] != 1 || overview.Series.Requests["2026-04-16T10:00:00Z"] != 1 {
+	if overview.Series.Requests["2026-04-16T17:00:00+08:00"] != 1 || overview.Series.Requests["2026-04-16T18:00:00+08:00"] != 1 {
 		t.Fatalf("unexpected hourly request series: %+v", overview.Series.Requests)
 	}
-	if overview.HourlySeries.Models["claude-sonnet"].Requests["2026-04-16T09:00:00Z"] != 1 {
+	if overview.HourlySeries.Models["claude-sonnet"].Requests["2026-04-16T17:00:00+08:00"] != 1 {
 		t.Fatalf("expected claude-sonnet hourly model series, got %+v", overview.HourlySeries.Models)
 	}
-	if overview.HourlySeries.Models["unknown"].Tokens["2026-04-16T10:00:00Z"] != 3150 {
+	if overview.HourlySeries.Models["unknown"].Tokens["2026-04-16T18:00:00+08:00"] != 3150 {
 		t.Fatalf("expected unknown hourly model token series, got %+v", overview.HourlySeries.Models)
 	}
 	if overview.DailySeries.Models["claude-sonnet"].Requests["2026-04-16"] != 1 {
@@ -288,6 +836,9 @@ func TestBuildUsageOverviewWithFilterBuilds24hHealthGridFor24hRange(t *testing.T
 	}
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 18, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
 	}
 
 	start := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
@@ -379,6 +930,9 @@ func TestBuildUsageOverviewWithFilterReturnsUnavailableCostForPartialPricing(t *
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
 	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
 
 	start := time.Date(2026, 4, 16, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 4, 16, 23, 59, 59, 999000000, time.UTC)
@@ -425,6 +979,9 @@ func TestBuildUsageOverviewWithFilterReturnsAvailableCostWhenUnpricedEventsHaveN
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
 	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
 
 	start := time.Date(2026, 4, 16, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 4, 16, 23, 59, 59, 999000000, time.UTC)
@@ -456,6 +1013,9 @@ func TestBuildUsageOverviewWithFilterReturnsUnavailableCostWithoutPricing(t *tes
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
 	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
 
 	start := time.Date(2026, 4, 16, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 4, 16, 23, 59, 59, 999000000, time.UTC)
@@ -473,6 +1033,8 @@ func TestBuildUsageOverviewWithFilterReturnsUnavailableCostWithoutPricing(t *tes
 }
 
 func TestBuildUsageOverviewWithFilterUsesExactPresetWindowMinutes(t *testing.T) {
+	withRepositoryTestLocation(t, "Asia/Shanghai")
+
 	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-overview-preset-window.db")})
 	if err != nil {
 		t.Fatalf("OpenDatabase returned error: %v", err)
@@ -493,7 +1055,7 @@ func TestBuildUsageOverviewWithFilterUsesExactPresetWindowMinutes(t *testing.T) 
 			start:           time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
 			end:             time.Date(2026, 4, 17, 12, 0, 0, 0, time.UTC),
 			expectMinutes:   1440,
-			expectBucketKey: "2026-04-17T12:00:00Z",
+			expectBucketKey: "2026-04-17T20:00:00+08:00",
 		},
 		{
 			name:            "7d uses daily buckets with 10080 minute window",
@@ -520,6 +1082,9 @@ func TestBuildUsageOverviewWithFilterUsesExactPresetWindowMinutes(t *testing.T) 
 			if _, _, err := InsertUsageEvents(db, []entities.UsageEvent{event}); err != nil {
 				t.Fatalf("InsertUsageEvents returned error: %v", err)
 			}
+			if err := AggregateUsageOverviewStats(context.Background(), db, tc.end); err != nil {
+				t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+			}
 
 			overview, err := BuildUsageOverviewWithFilter(db, dto.UsageQueryFilter{Range: tc.rangeName, StartTime: &tc.start, EndTime: &tc.end})
 			if err != nil {
@@ -533,8 +1098,10 @@ func TestBuildUsageOverviewWithFilterUsesExactPresetWindowMinutes(t *testing.T) 
 				t.Fatalf("unexpected request series for %s: %+v", tc.rangeName, overview.Series.Requests)
 			}
 		})
-		if err := db.Exec("DELETE FROM usage_events").Error; err != nil {
-			t.Fatalf("DELETE usage_events returned error: %v", err)
+		for _, table := range []string{"usage_events", "usage_overview_hourly_stats", "usage_overview_daily_stats", "usage_overview_health_stats", "usage_overview_aggregation_checkpoints"} {
+			if err := db.Exec("DELETE FROM " + table).Error; err != nil {
+				t.Fatalf("DELETE %s returned error: %v", table, err)
+			}
 		}
 	}
 }
@@ -564,6 +1131,9 @@ func TestBuildUsageOverviewWithFilterBuildsLatestHourlySeriesForLongRanges(t *te
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
 	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
+	}
 
 	start := time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 4, 23, 23, 59, 59, 999000000, time.UTC)
@@ -575,16 +1145,16 @@ func TestBuildUsageOverviewWithFilterBuildsLatestHourlySeriesForLongRanges(t *te
 	if len(overview.Series.Requests) != 2 || overview.Series.Requests["2026-04-17"] != 1 || overview.Series.Requests["2026-04-24"] != 2 {
 		t.Fatalf("expected main overview series to remain daily for 7d, got %+v", overview.Series.Requests)
 	}
-	if _, ok := overview.HourlySeries.Requests["2026-04-17T08:00:00Z"]; ok {
+	if _, ok := overview.HourlySeries.Requests["2026-04-17T16:00:00+08:00"]; ok {
 		t.Fatalf("expected latest hourly series to exclude buckets before the latest 24 hours, got %+v", overview.HourlySeries.Requests)
 	}
-	if overview.HourlySeries.Requests["2026-04-23T22:00:00Z"] != 1 || overview.HourlySeries.Requests["2026-04-23T23:00:00Z"] != 1 {
+	if overview.HourlySeries.Requests["2026-04-24T06:00:00+08:00"] != 1 || overview.HourlySeries.Requests["2026-04-24T07:00:00+08:00"] != 1 {
 		t.Fatalf("unexpected latest hourly request series: %+v", overview.HourlySeries.Requests)
 	}
-	if overview.HourlySeries.Cost["2026-04-23T22:00:00Z"] != 1.999993 || overview.HourlySeries.Cost["2026-04-23T23:00:00Z"] != 2.999983 {
+	if overview.HourlySeries.Cost["2026-04-24T06:00:00+08:00"] != 1.999993 || overview.HourlySeries.Cost["2026-04-24T07:00:00+08:00"] != 2.999983 {
 		t.Fatalf("unexpected latest hourly cost series: %+v", overview.HourlySeries.Cost)
 	}
-	if overview.HourlySeries.InputTokens["2026-04-23T22:00:00Z"] != 2_000_000 || overview.HourlySeries.OutputTokens["2026-04-23T23:00:00Z"] != 13 {
+	if overview.HourlySeries.InputTokens["2026-04-24T06:00:00+08:00"] != 2_000_000 || overview.HourlySeries.OutputTokens["2026-04-24T07:00:00+08:00"] != 13 {
 		t.Fatalf("unexpected latest hourly token category series: %+v", overview.HourlySeries)
 	}
 	if overview.DailySeries.Requests["2026-04-17"] != 1 || overview.DailySeries.Requests["2026-04-24"] != 2 {
@@ -606,6 +1176,9 @@ func TestBuildUsageOverviewWithFilterUsesDailyBucketsForLongCustomRanges(t *test
 	}
 	if _, _, err := InsertUsageEvents(db, events); err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if err := AggregateUsageOverviewStats(context.Background(), db, time.Date(2026, 4, 27, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("AggregateUsageOverviewStats returned error: %v", err)
 	}
 
 	start := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)

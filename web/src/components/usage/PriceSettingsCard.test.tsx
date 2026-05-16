@@ -1,8 +1,27 @@
 import React from 'react';
+import '@/i18n';
 import { describe, expect, it } from 'vitest';
-import { buildPricingModelOptions } from './PriceSettingsCard';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { buildPricingModelOptions, PriceSettingsCard } from './PriceSettingsCard';
 
 const configuredBadge = <span data-testid="configured" />;
+
+describe('PriceSettingsCard', () => {
+  it('uses the model pricing settings title', () => {
+    const html = renderToStaticMarkup(
+      <PriceSettingsCard
+        modelNames={[]}
+        modelPrices={{}}
+        onPricesChange={() => undefined}
+        loading={false}
+      />,
+    );
+
+    expect(html).toContain('Model Pricing Settings');
+    expect(html).toContain('Pricing Settings');
+    expect(html).not.toContain('Model Pricing Table');
+  });
+});
 
 describe('buildPricingModelOptions', () => {
   it('keeps unpriced models selectable before priced models and marks priced models', () => {

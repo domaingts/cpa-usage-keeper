@@ -11,7 +11,7 @@ import {
 
 function identity(overrides: Partial<UsageIdentity>): UsageIdentity {
   return {
-    id: overrides.id ?? 1,
+    id: overrides.id ?? '1',
     name: overrides.name ?? '',
     auth_type: overrides.auth_type ?? 1,
     auth_type_name: overrides.auth_type_name ?? 'Auth File',
@@ -27,7 +27,7 @@ function identity(overrides: Partial<UsageIdentity>): UsageIdentity {
     reasoning_tokens: overrides.reasoning_tokens ?? 0,
     cached_tokens: overrides.cached_tokens ?? 0,
     total_tokens: overrides.total_tokens ?? 0,
-    last_aggregated_usage_event_id: overrides.last_aggregated_usage_event_id ?? 0,
+    last_aggregated_usage_event_id: overrides.last_aggregated_usage_event_id ?? '0',
     first_used_at: overrides.first_used_at,
     last_used_at: overrides.last_used_at,
     stats_updated_at: overrides.stats_updated_at,
@@ -44,9 +44,9 @@ function identity(overrides: Partial<UsageIdentity>): UsageIdentity {
 describe('credentialViewModels', () => {
   it('splits usage identities by auth type while keeping deleted rows for traffic display', () => {
     const groups = splitCredentialIdentities([
-      identity({ id: 1, auth_type: 1, identity: 'auth-file' }),
-      identity({ id: 2, auth_type: 2, identity: 'api-key' }),
-      identity({ id: 3, auth_type: 1, identity: 'deleted-auth-file', is_deleted: true }),
+      identity({ id: '1', auth_type: 1, identity: 'auth-file' }),
+      identity({ id: '2', auth_type: 2, identity: 'api-key' }),
+      identity({ id: '3', auth_type: 1, identity: 'deleted-auth-file', is_deleted: true }),
     ])
 
     expect(groups.authFiles.map((item) => item.identity)).toEqual(['auth-file', 'deleted-auth-file'])
@@ -69,6 +69,36 @@ describe('credentialViewModels', () => {
     ])
   })
 
+  it('prefers refreshed quota plan type over usage identity plan type', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['auth-1', [
+        { key: 'rate_limit.primary_window', planType: 'pro' },
+      ]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([
+      identity({ identity: 'auth-1', plan_type: 'plus' }),
+    ], quotas)
+
+    expect(rows[0].planTypeLabel).toBe('Pro')
+    expect(rows[0].planTypeTone).toBe('pro')
+  })
+
+  it('formats unknown refreshed quota plan types in the frontend', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['auth-1', [
+        { key: 'rate_limit.primary_window', planType: ' enterprise ' },
+      ]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([
+      identity({ identity: 'auth-1', plan_type: 'plus' }),
+    ], quotas)
+
+    expect(rows[0].planTypeLabel).toBe('Enterprise')
+    expect(rows[0].planTypeTone).toBe('neutral')
+  })
+
   it('builds active-until remaining days badge with zero as the minimum', () => {
     vi.setSystemTime(new Date('2026-05-10T10:00:00Z'))
     try {
@@ -85,16 +115,16 @@ describe('credentialViewModels', () => {
 
   it('selects only active current-page auth files for quota requests', () => {
     const rows = [
-      identity({ id: 1, auth_type: 1, identity: 'active-auth-file' }),
-      identity({ id: 2, auth_type: 1, identity: 'deleted-auth-file', is_deleted: true }),
-      identity({ id: 3, auth_type: 2, identity: 'api-key' }),
+      identity({ id: '1', auth_type: 1, identity: 'active-auth-file' }),
+      identity({ id: '2', auth_type: 1, identity: 'deleted-auth-file', is_deleted: true }),
+      identity({ id: '3', auth_type: 2, identity: 'api-key' }),
     ]
 
     expect(selectQuotaEligibleAuthIndexes(rows)).toEqual(['active-auth-file'])
   })
 
   it('paginates credentials with a fixed page size of ten', () => {
-    const identities = Array.from({ length: 25 }, (_, index) => identity({ id: index + 1, identity: `auth-${index + 1}` }))
+    const identities = Array.from({ length: 25 }, (_, index) => identity({ id: String(index + 1), identity: `auth-${index + 1}` }))
 
     const firstPage = paginateCredentials(identities, 1)
     const thirdPage = paginateCredentials(identities, 3)
@@ -115,7 +145,7 @@ describe('credentialViewModels', () => {
       ]],
     ])
 
-    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1', displayName: 'Claude Auth', total_requests: 10, success_count: 9, input_tokens: 1000, cached_tokens: 250, total_tokens: 1500 })], quotas)
+    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1', displayName: 'Claude Auth', total_requests: 10, success_count: 9, input_tokens: 750, cached_tokens: 250, total_tokens: 1500 })], quotas)
 
     expect(rows[0].displayName).toBe('Claude Auth')
     expect(rows[0].typeLabel).toBe('claude')
@@ -134,6 +164,30 @@ describe('credentialViewModels', () => {
     expect(rows[0].secondaryQuota?.percentKind).toBe('used')
     expect(rows[0].secondaryQuota?.barPercent).toBe(60)
     expect(rows[0].extraQuota.map((quota) => quota.label)).toEqual(['Code Assist Credit'])
+  })
+
+  it('uses Claude token semantics for auth file cache rate', () => {
+    const rows = buildAuthFileCredentialRows([
+      identity({ identity: 'auth-claude', type: 'claude', input_tokens: 400, cached_tokens: 600 }),
+    ])
+
+    expect(rows[0].cacheRate).toBe(60)
+  })
+
+  it('classifies quota bar colors at 50 and 20 percent remaining thresholds', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['green-auth', [{ key: 'rate_limit.primary_window', label: '5h', remainingFraction: 0.5 }]],
+      ['yellow-auth', [{ key: 'rate_limit.primary_window', label: '5h', remainingFraction: 0.49 }]],
+      ['red-auth', [{ key: 'rate_limit.primary_window', label: '5h', remainingFraction: 0.19 }]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([
+      identity({ identity: 'green-auth' }),
+      identity({ identity: 'yellow-auth' }),
+      identity({ identity: 'red-auth' }),
+    ], quotas)
+
+    expect(rows.map((row) => row.primaryQuota?.status)).toEqual(['ok', 'warning', 'danger'])
   })
 
   it('uses quota window duration instead of raw key when classifying Codex windows', () => {

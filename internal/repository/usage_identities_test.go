@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -104,6 +105,55 @@ func TestUsageIdentityReplaceForAuthTypeMarksStaleRowsDeletedAndPreservesStats(t
 	provider := byIdentity["provider-1"]
 	if provider.IsDeleted || provider.DeletedAt != nil {
 		t.Fatalf("expected unrelated provider identity untouched, got %+v", provider)
+	}
+}
+
+func TestUsageIdentityReplaceForAuthTypeDoesNotConsumeIDsForExistingIdentities(t *testing.T) {
+	db := openTestDatabase(t)
+	ctx := context.Background()
+	firstSync := time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC)
+
+	if err := ReplaceUsageIdentitiesForAuthType(ctx, db, []entities.UsageIdentity{{
+		Name:     "Auth One",
+		Identity: "auth-1",
+		Type:     "account",
+		Provider: "claude",
+	}}, entities.UsageIdentityAuthTypeAuthFile, firstSync); err != nil {
+		t.Fatalf("initial replace returned error: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := ReplaceUsageIdentitiesForAuthType(ctx, db, []entities.UsageIdentity{{
+			Name:     "Auth One",
+			Identity: "auth-1",
+			Type:     "account",
+			Provider: "claude",
+		}}, entities.UsageIdentityAuthTypeAuthFile, firstSync.Add(time.Duration(i+1)*time.Minute)); err != nil {
+			t.Fatalf("repeat replace returned error: %v", err)
+		}
+	}
+	if err := ReplaceUsageIdentitiesForAuthType(ctx, db, []entities.UsageIdentity{
+		{
+			Name:     "Auth One",
+			Identity: "auth-1",
+			Type:     "account",
+			Provider: "claude",
+		},
+		{
+			Name:     "Auth Two",
+			Identity: "auth-2",
+			Type:     "account",
+			Provider: "claude",
+		},
+	}, entities.UsageIdentityAuthTypeAuthFile, firstSync.Add(time.Hour)); err != nil {
+		t.Fatalf("new identity replace returned error: %v", err)
+	}
+
+	var row entities.UsageIdentity
+	if err := db.Where("identity = ?", "auth-2").First(&row).Error; err != nil {
+		t.Fatalf("expected new identity row: %v", err)
+	}
+	if row.ID != 2 {
+		t.Fatalf("expected second identity id to be 2 without upsert sequence burn, got %d", row.ID)
 	}
 }
 
@@ -668,6 +718,43 @@ func TestUsageIdentityListActiveExcludesDeletedRows(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("expected active identities ordered as %v, got %v", want, got)
 		}
+	}
+}
+
+func TestUsageIdentityListActivePageOrdersByTotalRequestsDesc(t *testing.T) {
+	db := openTestDatabase(t)
+	now := time.Date(2026, 5, 11, 10, 0, 0, 0, time.UTC)
+	rows := []entities.UsageIdentity{
+		{Identity: "low", Name: "Low", AuthType: entities.UsageIdentityAuthTypeAuthFile, AuthTypeName: "oauth", Type: "claude", Provider: "Claude", TotalRequests: 10, CreatedAt: now, UpdatedAt: now},
+		{Identity: "high", Name: "High", AuthType: entities.UsageIdentityAuthTypeAuthFile, AuthTypeName: "oauth", Type: "claude", Provider: "Claude", TotalRequests: 30, CreatedAt: now, UpdatedAt: now},
+		{Identity: "middle", Name: "Middle", AuthType: entities.UsageIdentityAuthTypeAuthFile, AuthTypeName: "oauth", Type: "claude", Provider: "Claude", TotalRequests: 20, CreatedAt: now, UpdatedAt: now},
+		{Identity: "provider", Name: "Provider", AuthType: entities.UsageIdentityAuthTypeAIProvider, AuthTypeName: "api_key", Type: "openai", Provider: "OpenAI", TotalRequests: 99, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatalf("seed usage identities: %v", err)
+	}
+	authType := entities.UsageIdentityAuthTypeAuthFile
+
+	items, total, err := ListActiveUsageIdentitiesPage(context.Background(), db, ListUsageIdentitiesPageRequest{AuthType: &authType, Page: 1, PageSize: 2})
+	if err != nil {
+		t.Fatalf("list page: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("expected total 3, got %d", total)
+	}
+	if got := []string{items[0].Identity, items[1].Identity}; !reflect.DeepEqual(got, []string{"high", "middle"}) {
+		t.Fatalf("expected first page sorted by total requests desc, got %v", got)
+	}
+
+	items, total, err = ListActiveUsageIdentitiesPage(context.Background(), db, ListUsageIdentitiesPageRequest{AuthType: &authType, Page: 2, PageSize: 2})
+	if err != nil {
+		t.Fatalf("list second page: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("expected total 3 on second page, got %d", total)
+	}
+	if got := []string{items[0].Identity}; !reflect.DeepEqual(got, []string{"low"}) {
+		t.Fatalf("expected second page sorted by total requests desc, got %v", got)
 	}
 }
 

@@ -20,6 +20,7 @@ type UsageFilter struct {
 	Model     string
 	Source    string
 	AuthIndex string
+	APIKeyID  string
 	Result    string
 }
 
@@ -40,57 +41,23 @@ type UsageEventFilterOptions struct {
 
 // UsageEventRecord 是单条 usage event 的服务层结果。
 type UsageEventRecord struct {
-	ID              uint
-	Timestamp       time.Time
-	APIGroupKey     string
-	Model           string
-	AuthType        string
-	Provider        string
-	Source          string
-	AuthIndex       string
-	Failed          bool
-	LatencyMS       int64
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	TotalTokens     int64
-}
-
-// UsageAnalysisModelStat 是按模型聚合的分析结果。
-type UsageAnalysisModelStat struct {
-	Model              string
-	TotalRequests      int64
-	SuccessCount       int64
-	FailureCount       int64
-	TotalTokens        int64
-	InputTokens        int64
-	OutputTokens       int64
-	ReasoningTokens    int64
-	CachedTokens       int64
-	TotalLatencyMS     int64
-	LatencySampleCount int64
-}
-
-// UsageAnalysisAPIStat 是按 API 聚合的分析结果。
-type UsageAnalysisAPIStat struct {
-	APIKey          string
-	DisplayName     string
-	TotalRequests   int64
-	SuccessCount    int64
-	FailureCount    int64
-	TotalTokens     int64
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	Models          []UsageAnalysisModelStat
-}
-
-// UsageAnalysisSnapshot 是 analysis 的服务层结果。
-type UsageAnalysisSnapshot struct {
-	APIs   []UsageAnalysisAPIStat
-	Models []UsageAnalysisModelStat
+	ID                  int64
+	Timestamp           time.Time
+	APIGroupKey         string
+	Model               string
+	AuthType            string
+	Provider            string
+	Source              string
+	AuthIndex           string
+	Failed              bool
+	LatencyMS           int64
+	InputTokens         int64
+	OutputTokens        int64
+	ReasoningTokens     int64
+	CachedTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	TotalTokens         int64
 }
 
 // UsageOverviewSummary 是 overview summary 的服务层结果。

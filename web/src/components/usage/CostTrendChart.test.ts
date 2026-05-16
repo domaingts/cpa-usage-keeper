@@ -171,6 +171,56 @@ describe('buildOverviewCostTrendSeries', () => {
     expect(result.hasData).toBe(true);
   });
 
+  it('keeps yesterday hour view aligned to 24 project-timezone buckets', () => {
+    const result = buildOverviewCostTrendSeries({
+      usage: {
+        ...usageWithBackendCost,
+        hourly_series: {
+          ...usageWithBackendCost.hourly_series!,
+          cost: {
+            '2026-04-23T00:00:00+08:00': 1.47,
+            '2026-04-23T23:00:00+08:00': 2.34,
+          },
+        },
+      },
+      period: 'hour',
+      hourWindowHours: 24,
+      endMs: Date.parse('2026-04-23T23:59:59.999+08:00'),
+    });
+
+    expect(result.labels).toHaveLength(24);
+    expect(result.labels[0]).toBe('00:00');
+    expect(result.labels[23]).toBe('23:00');
+    expect(result.data[0]).toBe(1.47);
+    expect(result.data[23]).toBe(2.34);
+    expect(result.hasData).toBe(true);
+  });
+
+  it('keeps short-range hour view aligned to project timezone backend buckets', () => {
+    const result = buildOverviewCostTrendSeries({
+      usage: {
+        ...usageWithBackendCost,
+        hourly_series: {
+          ...usageWithBackendCost.hourly_series!,
+          cost: {
+            '2026-04-24T02:00:00+08:00': 1.47,
+            '2026-04-24T03:00:00+08:00': 0,
+            '2026-04-24T04:00:00+08:00': 0,
+            '2026-04-24T05:00:00+08:00': 0,
+            '2026-04-24T06:00:00+08:00': 0,
+          },
+        },
+      },
+      period: 'hour',
+      hourWindowHours: 4,
+      endMs: Date.parse('2026-04-24T06:16:00+08:00'),
+    });
+
+    expect(result.labels).toHaveLength(5);
+    expect(result.data).toEqual([1.47, 0, 0, 0, 0]);
+    expect(result.hasData).toBe(true);
+  });
+
   it('keeps short-range hour view aligned to backend partial-hour buckets', () => {
     const result = buildOverviewCostTrendSeries({
       usage: {

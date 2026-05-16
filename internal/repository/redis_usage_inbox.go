@@ -9,8 +9,11 @@ import (
 	"unicode/utf8"
 
 	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/timeutil"
 	"gorm.io/gorm"
 )
+
+const redisUsageInboxProcessingColumns = "id, queue_key, raw_message, status, attempt_count, usage_event_key, popped_at"
 
 const (
 	RedisUsageInboxStatusPending       = "pending"
@@ -38,7 +41,7 @@ func InsertRedisUsageInboxMessages(db *gorm.DB, inputs []dto.RedisInboxInsert) (
 			RawMessage:   input.RawMessage,
 			Status:       RedisUsageInboxStatusPending,
 			AttemptCount: 0,
-			PoppedAt:     input.PoppedAt.UTC(),
+			PoppedAt:     timeutil.NormalizeStorageTime(input.PoppedAt),
 		})
 	}
 
@@ -51,20 +54,20 @@ func InsertRedisUsageInboxMessages(db *gorm.DB, inputs []dto.RedisInboxInsert) (
 	return rows, nil
 }
 
-func MarkRedisUsageInboxProcessed(db *gorm.DB, id uint, eventKey string, processedAt time.Time) error {
+func MarkRedisUsageInboxProcessed(db *gorm.DB, id int64, eventKey string, processedAt time.Time) error {
 	return db.Model(&entities.RedisUsageInbox{}).Where("id = ?", id).Updates(map[string]any{
 		"status":          RedisUsageInboxStatusProcessed,
 		"usage_event_key": eventKey,
-		"processed_at":    processedAt.UTC(),
+		"processed_at":    timeutil.FormatStorageTime(processedAt),
 		"last_error":      "",
 	}).Error
 }
 
-func MarkRedisUsageInboxDecodeFailed(db *gorm.DB, id uint, decodeErr error) error {
+func MarkRedisUsageInboxDecodeFailed(db *gorm.DB, id int64, decodeErr error) error {
 	return markRedisUsageInboxFailed(db, id, RedisUsageInboxStatusDecodeFailed, decodeErr)
 }
 
-func MarkRedisUsageInboxProcessFailed(db *gorm.DB, id uint, processErr error) error {
+func MarkRedisUsageInboxProcessFailed(db *gorm.DB, id int64, processErr error) error {
 	return db.Model(&entities.RedisUsageInbox{}).Where("id = ?", id).Updates(map[string]any{
 		"status": gorm.Expr(
 			"CASE WHEN attempt_count + ? >= ? THEN ? ELSE ? END",
@@ -80,7 +83,7 @@ func MarkRedisUsageInboxProcessFailed(db *gorm.DB, id uint, processErr error) er
 
 // ListProcessableRedisUsageInbox 返回待处理和可重试的数据，不返回已解码失败或已丢弃的数据。
 func ListProcessableRedisUsageInbox(db *gorm.DB, limit int) ([]entities.RedisUsageInbox, error) {
-	query := db.Where("status = ? OR status = ?", RedisUsageInboxStatusPending, RedisUsageInboxStatusProcessFailed).Order("id asc")
+	query := db.Select(redisUsageInboxProcessingColumns).Where("status = ? OR status = ?", RedisUsageInboxStatusPending, RedisUsageInboxStatusProcessFailed).Order("id asc")
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -92,7 +95,7 @@ func ListProcessableRedisUsageInbox(db *gorm.DB, limit int) ([]entities.RedisUsa
 }
 
 func ListPendingRedisUsageInbox(db *gorm.DB, limit int) ([]entities.RedisUsageInbox, error) {
-	query := db.Where("status = ?", RedisUsageInboxStatusPending).Order("id asc")
+	query := db.Select(redisUsageInboxProcessingColumns).Where("status = ?", RedisUsageInboxStatusPending).Order("id asc")
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -108,8 +111,8 @@ func ListPendingRedisUsageInbox(db *gorm.DB, limit int) ([]entities.RedisUsageIn
 func CleanupRedisUsageInbox(db *gorm.DB, now time.Time) (dto.RedisUsageInboxCleanupResult, error) {
 	localNow := now.In(time.Local)
 	localDayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, time.Local)
-	processedCutoff := localDayStart.UTC()
-	failedCutoff := now.UTC().AddDate(0, 0, -7)
+	processedCutoff := timeutil.FormatStorageTime(localDayStart)
+	failedCutoff := timeutil.FormatStorageTime(now.AddDate(0, 0, -7))
 	result := dto.RedisUsageInboxCleanupResult{}
 
 	processedDelete := db.Where("status = ? AND processed_at IS NOT NULL AND processed_at < ?", RedisUsageInboxStatusProcessed, processedCutoff).Delete(&entities.RedisUsageInbox{})
@@ -127,7 +130,7 @@ func CleanupRedisUsageInbox(db *gorm.DB, now time.Time) (dto.RedisUsageInboxClea
 	return result, nil
 }
 
-func markRedisUsageInboxFailed(db *gorm.DB, id uint, status string, err error) error {
+func markRedisUsageInboxFailed(db *gorm.DB, id int64, status string, err error) error {
 	return db.Model(&entities.RedisUsageInbox{}).Where("id = ?", id).Updates(map[string]any{
 		"status":        status,
 		"attempt_count": gorm.Expr("attempt_count + ?", 1),

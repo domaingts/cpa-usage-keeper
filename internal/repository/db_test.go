@@ -2,6 +2,7 @@ package repository
 
 import (
 	"bytes"
+	"context"
 	"cpa-usage-keeper/internal/repository/dto"
 	"fmt"
 	"path/filepath"
@@ -52,11 +53,46 @@ func TestOpenDatabaseCreatesFreshDatabaseFromCurrentSchemaWithoutRunningMigratio
 	if err := db.Table("schema_migrations").Count(&count).Error; err != nil {
 		t.Fatalf("count schema migrations: %v", err)
 	}
-	if count != 17 {
-		t.Fatalf("expected fresh database to mark 17 migrations applied, got %d", count)
+	if count != 25 {
+		t.Fatalf("expected fresh database to mark 25 migrations applied, got %d", count)
 	}
 	if strings.Contains(logs.String(), "schema migration started") {
 		t.Fatalf("expected fresh database creation not to run version migrations, got logs:\n%s", logs.String())
+	}
+	for _, indexName := range []string{
+		"idx_usage_events_api_group_key",
+		"idx_usage_events_auth_index",
+		"idx_usage_events_model",
+		"idx_usage_events_auth_type_auth_index_id",
+		"uniq_usage_overview_hourly_stats_bucket_api_model",
+		"idx_usage_overview_hourly_stats_api_bucket",
+		"idx_usage_overview_hourly_stats_api_model_bucket",
+		"uniq_usage_overview_daily_stats_bucket_api_model",
+		"idx_usage_overview_daily_stats_api_bucket",
+		"idx_usage_overview_daily_stats_api_model_bucket",
+		"uniq_usage_overview_health_stats_bucket_span_api",
+		"idx_usage_overview_health_stats_api_bucket_span",
+	} {
+		assertSQLiteIndexExists(t, db, indexName)
+	}
+	for _, indexName := range []string{
+		"idx_usage_events_source",
+		"idx_usage_events_auth_type_source_id",
+	} {
+		if repositorySQLiteIndexExists(t, db, indexName) {
+			t.Fatalf("expected sqlite index %s not to exist", indexName)
+		}
+	}
+}
+
+func assertSQLiteIndexExists(t *testing.T, db *gorm.DB, indexName string) {
+	t.Helper()
+	var count int64
+	if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?", indexName).Scan(&count).Error; err != nil {
+		t.Fatalf("check sqlite index %s: %v", indexName, err)
+	}
+	if count != 1 {
+		t.Fatalf("expected sqlite index %s to exist, got %d", indexName, count)
 	}
 }
 
@@ -96,28 +132,31 @@ func TestOpenDatabaseConfiguresSQLiteRuntime(t *testing.T) {
 	}
 }
 
-func TestInsertUsageEventsDeduplicatesByEventKey(t *testing.T) {
+func TestInsertUsageEventsPersistsDuplicateEventKeys(t *testing.T) {
 	db := openTestDatabase(t)
 	events := []entities.UsageEvent{
 		{EventKey: "event-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC), TotalTokens: 10},
-		{EventKey: "event-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC), TotalTokens: 10},
-		{EventKey: "event-2", APIGroupKey: "provider-a", Model: "claude-opus", Timestamp: time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC), TotalTokens: 20},
+		{EventKey: "event-1", APIGroupKey: "provider-a", Model: "claude-opus", Timestamp: time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC), TotalTokens: 20},
+		{EventKey: "event-2", APIGroupKey: "provider-a", Model: "claude-haiku", Timestamp: time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC), TotalTokens: 30},
 	}
 
 	inserted, deduped, err := InsertUsageEvents(db, events)
 	if err != nil {
 		t.Fatalf("InsertUsageEvents returned error: %v", err)
 	}
-	if inserted != 2 || deduped != 1 {
-		t.Fatalf("expected inserted=2 deduped=1, got inserted=%d deduped=%d", inserted, deduped)
+	if inserted != 3 || deduped != 0 {
+		t.Fatalf("expected inserted=3 deduped=0, got inserted=%d deduped=%d", inserted, deduped)
 	}
 
-	var count int64
-	if err := db.Model(&entities.UsageEvent{}).Count(&count).Error; err != nil {
-		t.Fatalf("count usage events: %v", err)
+	var rows []entities.UsageEvent
+	if err := db.Order("id asc").Find(&rows).Error; err != nil {
+		t.Fatalf("list usage events: %v", err)
 	}
-	if count != 2 {
-		t.Fatalf("expected 2 persisted usage events, got %d", count)
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 persisted usage events, got %d", len(rows))
+	}
+	if rows[0].EventKey != "event-1" || rows[0].Model != "claude-sonnet" || rows[1].EventKey != "event-1" || rows[1].Model != "claude-opus" {
+		t.Fatalf("expected duplicate event_key rows to preserve their own models, got %+v", rows)
 	}
 }
 
@@ -185,6 +224,82 @@ func TestInsertUsageEventsPersistsModelAlias(t *testing.T) {
 	}
 }
 
+func TestDatabaseTimeFieldsUseProjectTimezoneRFC3339Nano(t *testing.T) {
+	previousLocal := time.Local
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("load location: %v", err)
+	}
+	time.Local = location
+	t.Cleanup(func() { time.Local = previousLocal })
+	db := openTestDatabase(t)
+
+	storageTime := time.Date(2026, 5, 12, 21, 59, 18, 353569620, location)
+	if _, _, err := InsertUsageEvents(db, []entities.UsageEvent{{
+		EventKey:    "event-storage-time",
+		APIGroupKey: "provider-a",
+		Model:       "claude-sonnet",
+		Timestamp:   storageTime,
+		AuthType:    "oauth",
+		AuthIndex:   "auth-1",
+		TotalTokens: 1,
+	}}); err != nil {
+		t.Fatalf("InsertUsageEvents returned error: %v", err)
+	}
+	if _, err := UpsertModelPriceSetting(db, dto.ModelPriceSettingInput{Model: "claude-sonnet", PromptPricePer1M: 1}); err != nil {
+		t.Fatalf("UpsertModelPriceSetting returned error: %v", err)
+	}
+	inboxRows, err := InsertRedisUsageInboxMessages(db, []dto.RedisInboxInsert{{QueueKey: "queue", RawMessage: `{"request_id":"event-storage-time"}`, PoppedAt: storageTime}})
+	if err != nil {
+		t.Fatalf("InsertRedisUsageInboxMessages returned error: %v", err)
+	}
+	if err := MarkRedisUsageInboxProcessed(db, inboxRows[0].ID, "event-storage-time", storageTime); err != nil {
+		t.Fatalf("MarkRedisUsageInboxProcessed returned error: %v", err)
+	}
+	activeStart := storageTime
+	activeUntil := storageTime.Add(time.Hour)
+	if err := ReplaceUsageIdentitiesForAuthType(context.Background(), db, []entities.UsageIdentity{{
+		Name:        "Auth 1",
+		Identity:    "auth-1",
+		ActiveStart: &activeStart,
+		ActiveUntil: &activeUntil,
+	}}, entities.UsageIdentityAuthTypeAuthFile, storageTime); err != nil {
+		t.Fatalf("ReplaceUsageIdentitiesForAuthType returned error: %v", err)
+	}
+	if err := AggregateUsageIdentityStats(context.Background(), db, storageTime); err != nil {
+		t.Fatalf("AggregateUsageIdentityStats returned error: %v", err)
+	}
+	if err := ReplaceUsageIdentitiesForAuthType(context.Background(), db, nil, entities.UsageIdentityAuthTypeAuthFile, storageTime); err != nil {
+		t.Fatalf("ReplaceUsageIdentitiesForAuthType delete returned error: %v", err)
+	}
+
+	for _, check := range []struct {
+		table string
+		field string
+		where string
+	}{
+		{table: "usage_events", field: "timestamp", where: "event_key = 'event-storage-time'"},
+		{table: "usage_events", field: "created_at", where: "event_key = 'event-storage-time'"},
+		{table: "model_price_settings", field: "created_at", where: "model = 'claude-sonnet'"},
+		{table: "model_price_settings", field: "updated_at", where: "model = 'claude-sonnet'"},
+		{table: "redis_usage_inboxes", field: "popped_at", where: "usage_event_key = 'event-storage-time'"},
+		{table: "redis_usage_inboxes", field: "processed_at", where: "usage_event_key = 'event-storage-time'"},
+		{table: "redis_usage_inboxes", field: "created_at", where: "usage_event_key = 'event-storage-time'"},
+		{table: "redis_usage_inboxes", field: "updated_at", where: "usage_event_key = 'event-storage-time'"},
+		{table: "usage_identities", field: "active_start", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "active_until", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "first_used_at", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "last_used_at", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "stats_updated_at", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "created_at", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "updated_at", where: "identity = 'auth-1'"},
+		{table: "usage_identities", field: "deleted_at", where: "identity = 'auth-1'"},
+		{table: "schema_migrations", field: "applied_at", where: "version = '20260503_add_usage_event_redis_fields'"},
+	} {
+		assertProjectTimezoneStorageValue(t, rawSQLiteTimeValue(t, db, check.table, check.field, check.where), check.table+"."+check.field)
+	}
+}
+
 func TestCleanupStorageCleansRedisInboxAndVacuums(t *testing.T) {
 	previousLocal := time.Local
 	location, err := time.LoadLocation("Asia/Shanghai")
@@ -206,6 +321,12 @@ func TestCleanupStorageCleansRedisInboxAndVacuums(t *testing.T) {
 	if err := db.Model(&entities.RedisUsageInbox{}).Where("id = ?", inboxRows[0].ID).Updates(map[string]any{"status": RedisUsageInboxStatusProcessed, "processed_at": time.Date(2026, 4, 26, 15, 59, 59, 0, time.UTC)}).Error; err != nil {
 		t.Fatalf("seed processed inbox row: %v", err)
 	}
+	if err := db.Create(&[]entities.UsageOverviewHealthStat{
+		{BucketStart: now.Add(-9 * 24 * time.Hour), SpanSeconds: 900, APIGroupKey: "old", SuccessCount: 1},
+		{BucketStart: now.Add(-7 * 24 * time.Hour), SpanSeconds: 900, APIGroupKey: "fresh", SuccessCount: 1},
+	}).Error; err != nil {
+		t.Fatalf("seed health stats: %v", err)
+	}
 
 	result, err := CleanupStorage(db, now)
 	if err != nil {
@@ -222,6 +343,13 @@ func TestCleanupStorageCleansRedisInboxAndVacuums(t *testing.T) {
 	if len(inboxRemaining) != 1 || inboxRemaining[0].ID != inboxRows[1].ID {
 		t.Fatalf("expected only pending inbox row to remain, got %+v", inboxRemaining)
 	}
+	var healthRemaining []entities.UsageOverviewHealthStat
+	if err := db.Order("api_group_key asc").Find(&healthRemaining).Error; err != nil {
+		t.Fatalf("load remaining health stats: %v", err)
+	}
+	if len(healthRemaining) != 1 || healthRemaining[0].APIGroupKey != "fresh" {
+		t.Fatalf("expected only fresh health stat row to remain, got %+v", healthRemaining)
+	}
 }
 
 func openTestDatabase(t *testing.T) *gorm.DB {
@@ -234,6 +362,28 @@ func openTestDatabase(t *testing.T) *gorm.DB {
 	}
 	closeTestDatabase(t, db)
 	return db
+}
+
+func rawSQLiteTimeValue(t *testing.T, db *gorm.DB, table string, field string, where string) string {
+	t.Helper()
+	var value string
+	if err := db.Raw(fmt.Sprintf("SELECT %s FROM %s WHERE %s LIMIT 1", field, table, where)).Scan(&value).Error; err != nil {
+		t.Fatalf("read raw time value %s.%s: %v", table, field, err)
+	}
+	if strings.TrimSpace(value) == "" {
+		t.Fatalf("expected raw time value for %s.%s", table, field)
+	}
+	return value
+}
+
+func assertProjectTimezoneStorageValue(t *testing.T, value string, field string) {
+	t.Helper()
+	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+		t.Fatalf("expected %s to use RFC3339Nano storage format, got %q: %v", field, value, err)
+	}
+	if !strings.Contains(value, "T") || !strings.Contains(value, "+08:00") || strings.Contains(value, "Z") || strings.Contains(value, "+00:00") {
+		t.Fatalf("expected %s to use project timezone offset storage format, got %q", field, value)
+	}
 }
 
 func closeTestDatabase(t *testing.T, db *gorm.DB) {

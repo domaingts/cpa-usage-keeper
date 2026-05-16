@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"cpa-usage-keeper/internal/timeutil"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
@@ -26,11 +27,19 @@ const (
 	migrationAddUsageEventModelAlias                = "20260508_add_usage_event_model_alias"
 	migrationUpdateUsageIdentityQuotaFields         = "20260509_update_usage_identity_quota_fields"
 	migrationRemoveUsageIdentityQuotaFields         = "20260510_remove_usage_identity_quota_fields"
+	migrationAddUsageIdentityBaseURL                = "20260511_add_usage_identity_base_url"
+	migrationNormalizeStorageTimesToProjectTZ       = "20260512_normalize_storage_times_to_project_tz"
+	migrationUseInt64PrimaryKeys                    = "20260513_use_int64_primary_keys"
+	migrationCreateCPAAPIKeys                       = "20260513_create_cpa_api_keys"
+	migrationAddUsageEventCacheTokenFields          = "20260514_add_usage_event_cache_token_fields"
+	migrationAddUsageEventPlainDimensionIndexes     = "20260514_add_usage_event_plain_dimension_indexes"
+	migrationCreateUsageOverviewStats               = "20260514_create_usage_overview_stats"
+	migrationRemoveUsageEventEventKeyUniqueIndex    = "20260514_remove_usage_event_event_key_unique_index"
 )
 
 type schemaMigration struct {
 	Version   string    `gorm:"primaryKey;column:version"`
-	AppliedAt time.Time `gorm:"not null;column:applied_at"`
+	AppliedAt time.Time `gorm:"serializer:storageTime;not null;column:applied_at"`
 }
 
 func (schemaMigration) TableName() string {
@@ -60,7 +69,7 @@ func MarkAllAsApplied(db *gorm.DB) error {
 		return err
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
-		now := time.Now().UTC()
+		now := timeutil.NormalizeStorageTime(time.Now())
 		for _, migration := range orderedMigrations() {
 			if err := tx.Exec("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)", migration.version, now).Error; err != nil {
 				return fmt.Errorf("mark schema migration %s applied: %w", migration.version, err)
@@ -96,6 +105,14 @@ func orderedMigrations() []databaseMigration {
 		{version: migrationAddUsageEventModelAlias, run: addUsageEventModelAliasMigration},
 		{version: migrationUpdateUsageIdentityQuotaFields, run: updateUsageIdentityQuotaFieldsMigration},
 		{version: migrationRemoveUsageIdentityQuotaFields, run: removeUsageIdentityQuotaFieldsMigration},
+		{version: migrationAddUsageIdentityBaseURL, run: addUsageIdentityBaseURLMigration},
+		{version: migrationNormalizeStorageTimesToProjectTZ, run: normalizeStorageTimesToProjectTZMigration},
+		{version: migrationUseInt64PrimaryKeys, run: useInt64PrimaryKeysMigration},
+		{version: migrationCreateCPAAPIKeys, run: createCPAAPIKeysMigration},
+		{version: migrationAddUsageEventCacheTokenFields, run: addUsageEventCacheTokenFieldsMigration},
+		{version: migrationAddUsageEventPlainDimensionIndexes, run: addUsageEventPlainDimensionIndexesMigration},
+		{version: migrationCreateUsageOverviewStats, run: createUsageOverviewStatsMigration},
+		{version: migrationRemoveUsageEventEventKeyUniqueIndex, run: removeUsageEventEventKeyUniqueIndexMigration},
 	}
 }
 
@@ -116,7 +133,7 @@ func runSchemaMigration(db *gorm.DB, migration databaseMigration) error {
 			logger.WithError(err).Error("schema migration failed")
 			return fmt.Errorf("run schema migration %s: %w", migration.version, err)
 		}
-		if err := tx.Create(&schemaMigration{Version: migration.version, AppliedAt: time.Now().UTC()}).Error; err != nil {
+		if err := tx.Create(&schemaMigration{Version: migration.version, AppliedAt: timeutil.NormalizeStorageTime(time.Now())}).Error; err != nil {
 			logger.WithError(err).Error("schema migration failed")
 			return fmt.Errorf("record schema migration %s: %w", migration.version, err)
 		}

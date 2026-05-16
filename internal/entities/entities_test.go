@@ -1,16 +1,29 @@
 package entities
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestAllIncludesCoreModels(t *testing.T) {
 	items := All()
-	if len(items) != 4 {
-		t.Fatalf("expected 4 models after removing legacy metadata tables, got %d", len(items))
+	expected := []any{
+		&UsageEvent{},
+		&RedisUsageInbox{},
+		&ModelPriceSetting{},
+		&UsageIdentity{},
+		&CPAAPIKey{},
+		&UsageOverviewHourlyStat{},
+		&UsageOverviewDailyStat{},
+		&UsageOverviewHealthStat{},
+		&UsageOverviewAggregationCheckpoint{},
 	}
-	if _, ok := items[0].(*UsageEvent); !ok {
-		t.Fatalf("expected UsageEvent to be first registered model, got %T", items[0])
+	if len(items) != len(expected) {
+		t.Fatalf("expected %d registered models, got %d", len(expected), len(items))
 	}
-	if _, ok := items[1].(*RedisUsageInbox); !ok {
-		t.Fatalf("expected RedisUsageInbox to be registered, got %T", items[1])
+	for index := range expected {
+		if got, want := reflect.TypeOf(items[index]), reflect.TypeOf(expected[index]); got != want {
+			t.Fatalf("expected model %d to be %v, got %v", index, want, got)
+		}
 	}
 }

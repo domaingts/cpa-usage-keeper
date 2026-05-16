@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"sync"
+	"time"
 
 	"cpa-usage-keeper/internal/api"
 	"cpa-usage-keeper/internal/auth"
@@ -22,8 +24,13 @@ import (
 	"gorm.io/gorm"
 )
 
+// Runner 是 App 后台任务的最小接口，具体语义由字段名和实现方法表达。
 type Runner interface {
 	Run(ctx context.Context) error
+}
+
+// StatusProvider 只提供前端状态和手动同步入口，不作为后台 runner 启动。
+type StatusProvider interface {
 	Status() poller.Status
 	SyncNow(ctx context.Context) error
 }
@@ -36,7 +43,9 @@ type App struct {
 	Config            *config.Config
 	DB                *gorm.DB
 	Router            *gin.Engine
-	Poller            Runner
+	Poller            StatusProvider
+	RedisPull         Runner
+	RedisProcess      Runner
 	Maintenance       *StorageCleanupRunner
 	MetadataSync      *MetadataSyncRunner
 	BackupMaintenance *DatabaseBackupRunner
@@ -70,6 +79,14 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 		_ = logCloser.Close()
 		return nil, err
 	}
+	// migrations 完成后、后台 runner 启动前先追平 Overview 增量表，避免首个页面请求触发大批量聚合。
+	logrus.Info("starting usage overview aggregation catch-up")
+	if err := repository.AggregateUsageOverviewStats(context.Background(), db, time.Now()); err != nil {
+		_ = closeGormDB(db)
+		_ = logCloser.Close()
+		return nil, err
+	}
+	logrus.Info("completed usage overview aggregation catch-up")
 
 	syncService := service.NewSyncService(db, cfg)
 	backgroundPoller := poller.NewRedisDrain(syncService, poller.RedisDrainConfig{
@@ -90,6 +107,7 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 
 	usageService := service.NewUsageService(db)
 	usageIdentityService := service.NewUsageIdentityService(db)
+	cpaAPIKeyService := service.NewCPAAPIKeyService(db)
 	cpaClient := cpa.NewClient(cfg.CPABaseURL, cfg.CPAManagementKey, cfg.RequestTimeout, cfg.TLSSkipVerify)
 	if cfg.TLSSkipVerify {
 		logrus.WithField("cpa_base_url", cfg.CPABaseURL).Warn("TLS certificate verification is disabled for CPA and Redis queue connections")
@@ -105,16 +123,19 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 	}, sessionManager)
 
 	return &App{
-		Config:            &cfg,
-		DB:                db,
-		Poller:            backgroundPoller,
+		Config: &cfg,
+		DB:     db,
+		Poller: backgroundPoller,
+		// Redis pull/process 分成两个后台 runner，避免远端拉取和本地 SQLite 处理互相等待。
+		RedisPull:         poller.NewRedisPullRunner(backgroundPoller),
+		RedisProcess:      poller.NewRedisProcessRunner(backgroundPoller),
 		Maintenance:       NewStorageCleanupRunner(syncService),
 		MetadataSync:      NewMetadataSyncRunner(syncService, cfg.MetadataSyncInterval),
 		BackupMaintenance: backupMaintenance,
 		LogCloser:         logCloser,
 		Router: api.NewRouter(
 			webui.Static,
-			newManualSyncRunner(backgroundPoller, syncService),
+			backgroundPoller,
 			usageService,
 			pricingService,
 			api.AuthConfig{
@@ -125,7 +146,7 @@ func NewWithConfig(cfg config.Config) (*App, error) {
 			},
 			authHandler,
 			cfg.AppBasePath,
-			api.OptionalProviders{UsageIdentity: usageIdentityService, Quota: quotaService},
+			api.OptionalProviders{UsageIdentity: usageIdentityService, Quota: quotaService, CPAAPIKeys: cpaAPIKeyService},
 		),
 	}, nil
 }
@@ -167,10 +188,17 @@ func (a *App) Run() error {
 
 	ctx := a.startBackgroundContext()
 	defer a.stopBackgroundTasks()
-	if a.Poller != nil {
+	if a.RedisPull != nil {
 		a.startBackgroundTask(func() {
-			if err := a.Poller.Run(ctx); err != nil {
-				logrus.Errorf("poller stopped: %v", err)
+			if err := a.RedisPull.Run(ctx); err != nil {
+				logrus.Errorf("redis pull stopped: %v", err)
+			}
+		})
+	}
+	if a.RedisProcess != nil {
+		a.startBackgroundTask(func() {
+			if err := a.RedisProcess.Run(ctx); err != nil {
+				logrus.Errorf("redis process stopped: %v", err)
 			}
 		})
 	}
@@ -196,7 +224,14 @@ func (a *App) Run() error {
 		})
 	}
 
-	return a.Router.Run(":" + a.Config.AppPort)
+	server := &http.Server{
+		Addr:    ":" + a.Config.AppPort,
+		Handler: a.Router,
+	}
+	if a.Config.TLSEnabled {
+		return server.ListenAndServeTLS(a.Config.TLSCertFile, a.Config.TLSKeyFile)
+	}
+	return server.ListenAndServe()
 }
 
 func (a *App) startBackgroundContext() context.Context {

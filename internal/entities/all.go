@@ -7,5 +7,10 @@ func All() []any {
 		&RedisUsageInbox{},
 		&ModelPriceSetting{},
 		&UsageIdentity{},
+		&CPAAPIKey{},
+		&UsageOverviewHourlyStat{},
+		&UsageOverviewDailyStat{},
+		&UsageOverviewHealthStat{},
+		&UsageOverviewAggregationCheckpoint{},
 	}
 }

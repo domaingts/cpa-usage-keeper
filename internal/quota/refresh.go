@@ -10,6 +10,7 @@ import (
 
 	"cpa-usage-keeper/internal/entities"
 	"cpa-usage-keeper/internal/repository"
+	"cpa-usage-keeper/internal/timeutil"
 
 	"gorm.io/gorm"
 )
@@ -33,7 +34,6 @@ const (
 
 type CacheRequest struct {
 	AuthIndexes []string `json:"auth_indexes"`
-	Limit       int      `json:"limit"`
 }
 
 type CacheResponse struct {
@@ -42,7 +42,6 @@ type CacheResponse struct {
 
 type RefreshRequest struct {
 	AuthIndexes []string      `json:"auth_indexes"`
-	Limit       int           `json:"limit"`
 	Source      RefreshSource `json:"source"`
 }
 
@@ -91,20 +90,16 @@ type RefreshTaskRecord struct {
 func (s *Service) GetCachedQuota(ctx context.Context, request CacheRequest) (CacheResponse, error) {
 	_ = ctx
 	// 缓存读取只返回已完成任务的结果，不触发新的 provider 请求。
-	limit := request.Limit
-	if limit <= 0 {
-		return CacheResponse{}, fmt.Errorf("%w: limit is required", ErrValidation)
+	if len(request.AuthIndexes) == 0 {
+		return CacheResponse{}, fmt.Errorf("%w: auth_indexes are required", ErrValidation)
 	}
-	response := CacheResponse{Items: make([]CheckResponse, 0, min(limit, len(request.AuthIndexes)))}
+	response := CacheResponse{Items: make([]CheckResponse, 0, len(request.AuthIndexes))}
 	s.cleanupExpiredRefreshTasks(time.Now())
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	// 按请求顺序去重并读取每个 auth_index 最近一次完成的任务缓存。
 	seen := make(map[string]struct{}, len(request.AuthIndexes))
 	for _, rawAuthIndex := range request.AuthIndexes {
-		if len(response.Items) >= limit {
-			break
-		}
 		authIndex := strings.TrimSpace(rawAuthIndex)
 		if authIndex == "" {
 			continue
@@ -129,9 +124,9 @@ func (s *Service) GetCachedQuota(ctx context.Context, request CacheRequest) (Cac
 
 func (s *Service) Refresh(ctx context.Context, request RefreshRequest) (RefreshResponse, error) {
 	// 刷新入口只负责校验、去重、建任务；实际 provider 调用交给后台 worker。
-	limit := request.Limit
+	limit := len(request.AuthIndexes)
 	if limit <= 0 {
-		return RefreshResponse{}, fmt.Errorf("%w: limit is required", ErrValidation)
+		return RefreshResponse{}, fmt.Errorf("%w: auth_indexes are required", ErrValidation)
 	}
 	response := RefreshResponse{Limit: limit}
 	seen := make(map[string]struct{}, len(request.AuthIndexes))
@@ -203,7 +198,7 @@ func (s *Service) validateRefreshAuthIndex(ctx context.Context, authIndex string
 	}
 
 	var active entities.UsageIdentity
-	if err := s.db.WithContext(ctx).Where("identity = ? AND is_deleted = ?", authIndex, false).First(&active).Error; err == nil {
+	if err := s.db.WithContext(ctx).Select("id, auth_type").Where("identity = ? AND is_deleted = ?", authIndex, false).First(&active).Error; err == nil {
 		return "not_auth_file", nil
 	} else if errors.Is(err, gorm.ErrRecordNotFound) {
 		return "not_found", nil
@@ -214,13 +209,14 @@ func (s *Service) validateRefreshAuthIndex(ctx context.Context, authIndex string
 
 func (s *Service) ensureRefreshTask(authIndex string, source RefreshSource) (*RefreshTaskRecord, bool) {
 	// 同一个 auth_index 已经 queued/running 时复用现有任务，避免重复打到上游接口。
-	now := time.Now().UTC()
+	now := timeutil.NormalizeStorageTime(time.Now())
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	if taskID, ok := s.refreshTaskIDsByAuth[authIndex]; ok {
 		if task, ok := s.refreshTasks[taskID]; ok && task.isActive() {
 			return task, false
 		}
+		delete(s.refreshTasks, taskID)
 	}
 	task := &RefreshTaskRecord{
 		TaskID:    fmt.Sprintf("quota-refresh-%d", atomic.AddUint64(&s.refreshTaskSeq, 1)),
@@ -268,7 +264,7 @@ func refreshTaskErrorMessage(err error) string {
 }
 
 func (s *Service) markRefreshTaskRunning(taskID string) (string, bool) {
-	now := time.Now().UTC()
+	now := timeutil.NormalizeStorageTime(time.Now())
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	task, ok := s.refreshTasks[taskID]
@@ -281,7 +277,7 @@ func (s *Service) markRefreshTaskRunning(taskID string) (string, bool) {
 }
 
 func (s *Service) markRefreshTaskCompleted(taskID string, response CheckResponse) {
-	now := time.Now().UTC()
+	now := timeutil.NormalizeStorageTime(time.Now())
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	task, ok := s.refreshTasks[taskID]
@@ -291,12 +287,11 @@ func (s *Service) markRefreshTaskCompleted(taskID string, response CheckResponse
 	task.Status = RefreshTaskStatusCompleted
 	task.FinishedAt = now
 	task.CachedAt = now
-	task.ExpiresAt = now.Add(s.refreshTaskTTL)
 	task.Quota = &response
 }
 
 func (s *Service) markRefreshTaskFailed(taskID string, message string) {
-	now := time.Now().UTC()
+	now := timeutil.NormalizeStorageTime(time.Now())
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	task, ok := s.refreshTasks[taskID]

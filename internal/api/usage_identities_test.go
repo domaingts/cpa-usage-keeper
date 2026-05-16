@@ -99,7 +99,7 @@ func TestUsageIdentitiesRouteReturnsMetadataStatsAndActiveRows(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d: %s", resp.Code, body)
 	}
-	if !contains(body, `"identities":[`) || !contains(body, `"id":1`) || !contains(body, `"identity":"2"`) {
+	if !contains(body, `"identities":[`) || !contains(body, `"id":"1"`) || !contains(body, `"identity":"2"`) {
 		t.Fatalf("expected auth file identity row in response, got %s", body)
 	}
 	if contains(body, "Deleted Provider") || contains(body, "sk-deleted-provider-secret") || contains(body, `"deleted_at"`) {
@@ -119,7 +119,7 @@ func TestUsageIdentitiesRouteReturnsMetadataStatsAndActiveRows(t *testing.T) {
 		`"reasoning_tokens":30`,
 		`"cached_tokens":40`,
 		`"total_tokens":370`,
-		`"last_aggregated_usage_event_id":99`,
+		`"last_aggregated_usage_event_id":"99"`,
 		`"first_used_at":"2026-05-04T08:00:00Z"`,
 		`"last_used_at":"2026-05-04T09:00:00Z"`,
 		`"stats_updated_at":"2026-05-04T10:00:00Z"`,
@@ -136,6 +136,7 @@ func TestUsageIdentitiesRouteDoesNotReturnUnpublishedMetadataFields(t *testing.T
 	activeUntil := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	accountID := "acct_123"
 	planType := "team"
+	baseURL := "https://api.openai.com/v1"
 	router := NewRouter(nil, nil, nil, nil, AuthConfig{}, nil, "", OptionalProviders{UsageIdentity: usageIdentitiesStub{items: []entities.UsageIdentity{{
 		ID:           1,
 		Name:         "Codex Account",
@@ -145,6 +146,7 @@ func TestUsageIdentitiesRouteDoesNotReturnUnpublishedMetadataFields(t *testing.T
 		Type:         "codex",
 		Provider:     "Codex",
 		Prefix:       "codex-prefix",
+		BaseURL:      baseURL,
 		AccountID:    &accountID,
 		ActiveStart:  &activeStart,
 		ActiveUntil:  &activeUntil,
@@ -170,6 +172,7 @@ func TestUsageIdentitiesRouteDoesNotReturnUnpublishedMetadataFields(t *testing.T
 	}
 	for _, forbidden := range []string{
 		`"prefix"`,
+		`"base_url"`,
 		`"account_id"`,
 	} {
 		if contains(body, forbidden) {
@@ -205,7 +208,7 @@ func TestUsageIdentitiesPageRouteFiltersByAuthTypeAndPaginates(t *testing.T) {
 	if captured.AuthType == nil || *captured.AuthType != entities.UsageIdentityAuthTypeAuthFile || captured.Page != 2 || captured.PageSize != 10 {
 		t.Fatalf("expected auth_type/page/page_size request, got %+v", captured)
 	}
-	for _, expected := range []string{`"identities":[`, `"id":11`, `"total_count":25`, `"page":2`, `"page_size":10`, `"total_pages":3`} {
+	for _, expected := range []string{`"identities":[`, `"id":"11"`, `"total_count":25`, `"page":2`, `"page_size":10`, `"total_pages":3`} {
 		if !contains(body, expected) {
 			t.Fatalf("expected %s in response body: %s", expected, body)
 		}

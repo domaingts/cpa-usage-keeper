@@ -1,8 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildCustomDateRangeQuery, getOverviewChartEndMs, getOverviewDisplayLoading, getOverviewHourWindowHours, getPreferredOverviewChartPeriod, getTimeRangeOptions, getUsageTabOptions, refreshPageData, sanitizeRequestEventFilters, scheduleOverviewAutoRefresh, shouldShowRangeControls, shouldShowUpdateCheckButton, getUpdateCheckToastDuration, syncCpaData } from './UsagePage';
-import { ApiError } from '@/lib/api';
+import { buildCustomDateRangeQuery, getCustomDateRangeBounds, getOverviewChartEndMs, getOverviewDisplayLoading, getOverviewHourWindowHours, getPreferredOverviewChartPeriod, getTimeRangeOptions, getUsageTabOptions, isCustomDateWithinBounds, openDateInputPicker, refreshPageData, sanitizeRequestEventFilters, scheduleOverviewAutoRefresh, shouldAutoRefreshUsageTab, shouldShowApiKeyFilter, shouldShowRangeControls, shouldShowUpdateCheckButton, getUpdateCheckToastDuration } from './UsagePage';
 import { filterUsageByWindow, type UsageFilterWindow } from '@/utils/usage';
-import type { StatusResponse, UsageSnapshot } from '@/lib/types';
+import type { UsageSnapshot } from '@/lib/types';
 
 const usage: UsageSnapshot = {
   total_requests: 2,
@@ -206,6 +205,25 @@ describe('UsagePage Overview auto-refresh', () => {
   });
 });
 
+describe('UsagePage active tab auto-refresh guard', () => {
+  it('allows Request Events auto-refresh only on the first page', () => {
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'events', eventsPage: 1, authFilePage: 1, aiProviderPage: 1 })).toBe(true);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'events', eventsPage: 2, authFilePage: 1, aiProviderPage: 1 })).toBe(false);
+  });
+
+  it('allows Credentials auto-refresh only when both lists are on the first page', () => {
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'credentials', eventsPage: 1, authFilePage: 1, aiProviderPage: 1 })).toBe(true);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'credentials', eventsPage: 1, authFilePage: 2, aiProviderPage: 1 })).toBe(false);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'credentials', eventsPage: 1, authFilePage: 1, aiProviderPage: 2 })).toBe(false);
+  });
+
+  it('keeps Overview auto-refresh enabled and does not auto-refresh other tabs', () => {
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'overview', eventsPage: 2, authFilePage: 2, aiProviderPage: 2 })).toBe(true);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'analysis', eventsPage: 1, authFilePage: 1, aiProviderPage: 1 })).toBe(false);
+    expect(shouldAutoRefreshUsageTab({ activeTab: 'settings', eventsPage: 1, authFilePage: 1, aiProviderPage: 1 })).toBe(false);
+  });
+});
+
 describe('UsagePage range filtering bug', () => {
   it('changes the usage payload that summary metrics read from', () => {
     const filterWindow: UsageFilterWindow = {
@@ -269,20 +287,33 @@ for (const [tab, expected] of [
   ['analysis', true],
   ['events', true],
   ['credentials', false],
-  ['pricing', false],
+  ['settings', false],
 ] as const) {
   it(`returns ${expected} for ${tab} range controls visibility`, () => {
     expect(shouldShowRangeControls(tab)).toBe(expected);
   });
 }
 
+for (const [tab, expected] of [
+  ['overview', true],
+  ['analysis', true],
+  ['events', true],
+  ['credentials', false],
+  ['settings', false],
+] as const) {
+  it(`returns ${expected} for ${tab} API Key filter visibility`, () => {
+    expect(shouldShowApiKeyFilter(tab)).toBe(expected);
+  });
+}
+
 describe('UsagePage time range options', () => {
-  it('includes rolling 24h, local Today, and 30d ranges', () => {
+  it('includes rolling 24h, local Today, Yesterday, and 30d ranges', () => {
     const options = getTimeRangeOptions((key) => `translated:${key}`);
 
-    expect(options.map((option) => option.value)).toEqual(['4h', '8h', '12h', '24h', 'today', '7d', '30d', 'custom']);
+    expect(options.map((option) => option.value)).toEqual(['4h', '8h', '12h', '24h', 'today', 'yesterday', '7d', '30d', 'custom']);
     expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_24h');
     expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_today');
+    expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_yesterday');
     expect(options.map((option) => option.label)).toContain('translated:usage_stats.range_30d');
   });
 });
@@ -296,6 +327,45 @@ describe('UsagePage Overview chart period preference', () => {
     expect(getPreferredOverviewChartPeriod({ windowMinutes: 24 * 60 })).toBe('hour');
     expect(getPreferredOverviewChartPeriod({ windowMinutes: (24 * 60) + 1 })).toBe('day');
     expect(getPreferredOverviewChartPeriod({ windowMinutes: 30 * 24 * 60 })).toBe('day');
+  });
+});
+
+describe('UsagePage custom date input bounds', () => {
+  it('limits selectable Custom dates to today through the first day of the previous month', () => {
+    expect(getCustomDateRangeBounds(Date.parse('2026-05-13T12:00:00.000Z'), 'UTC')).toEqual({
+      min: '2026-04-01',
+      max: '2026-05-13',
+    });
+  });
+
+  it('uses the project timezone when deriving Custom date bounds', () => {
+    expect(getCustomDateRangeBounds(Date.parse('2026-05-13T06:30:00.000Z'), 'America/Los_Angeles')).toEqual({
+      min: '2026-04-01',
+      max: '2026-05-12',
+    });
+  });
+
+  it('rejects tomorrow and dates before the first day of the previous month', () => {
+    const bounds = { min: '2026-04-01', max: '2026-05-13' };
+
+    expect(isCustomDateWithinBounds('2026-05-13', bounds)).toBe(true);
+    expect(isCustomDateWithinBounds('2026-04-01', bounds)).toBe(true);
+    expect(isCustomDateWithinBounds('2026-05-14', bounds)).toBe(false);
+    expect(isCustomDateWithinBounds('2026-03-31', bounds)).toBe(false);
+  });
+
+  it('opens the native date picker when the date field is activated', () => {
+    const showPicker = vi.fn();
+
+    openDateInputPicker({ showPicker } as unknown as HTMLInputElement);
+
+    expect(showPicker).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores browsers that reject programmatic date picker opening', () => {
+    const input = { showPicker: vi.fn(() => { throw new Error('not allowed') }) } as unknown as HTMLInputElement;
+
+    expect(() => openDateInputPicker(input)).not.toThrow();
   });
 });
 
@@ -318,7 +388,7 @@ describe('UsagePage custom date query', () => {
 });
 
 describe('UsagePage Overview chart window', () => {
-  it('uses the backend-resolved range end for Today hourly chart buckets', () => {
+  it('uses Today hourly chart buckets through the next day boundary', () => {
     const filterWindow: UsageFilterWindow = {
       startMs: Date.parse('2026-04-23T00:00:00.000Z'),
       endMs: Date.parse('2026-04-23T12:34:56.000Z'),
@@ -333,6 +403,23 @@ describe('UsagePage Overview chart window', () => {
       resolvedRangeEndMs: Date.parse('2026-04-23T15:59:59.999Z'),
     })).toBe(Date.parse('2026-04-24T00:00:00.000Z'));
   });
+
+  it('uses Yesterday hourly chart buckets through the next day boundary', () => {
+    const filterWindow: UsageFilterWindow = {
+      startMs: Date.parse('2026-04-23T00:00:00.000Z'),
+      endMs: Date.parse('2026-04-23T23:59:59.999Z'),
+      windowMinutes: 24 * 60,
+    };
+    const resolvedRangeEndMs = Date.parse('2026-04-23T23:59:59.999Z');
+
+    expect(getOverviewHourWindowHours({ timeRange: 'yesterday', filterWindow })).toBe(24);
+    expect(getOverviewChartEndMs({
+      timeRange: 'yesterday',
+      filterWindow,
+      fallbackEndMs: Date.parse('2026-04-24T12:34:56.000Z'),
+      resolvedRangeEndMs,
+    })).toBe(Date.parse('2026-04-24T00:00:00.000Z'));
+  });
 });
 
 describe('UsagePage tab labels', () => {
@@ -341,10 +428,10 @@ describe('UsagePage tab labels', () => {
 
     expect(labels).toEqual([
       'translated:usage_stats.tab_overview',
-      'translated:usage_stats.tab_credentials',
-      'translated:usage_stats.tab_events',
       'translated:usage_stats.tab_analysis',
-      'translated:usage_stats.tab_pricing',
+      'translated:usage_stats.tab_events',
+      'translated:usage_stats.tab_credentials',
+      'translated:usage_stats.tab_settings',
     ]);
   });
 });
@@ -352,86 +439,15 @@ describe('UsagePage tab labels', () => {
 describe('UsagePage refresh action', () => {
   it('reloads page data without triggering backend sync', async () => {
     let refreshCalls = 0;
-    let syncCalls = 0;
+    const syncCalls = 0;
 
     await refreshPageData({
       refreshActiveTab: async () => {
         refreshCalls += 1;
       },
-      triggerBackendSync: async () => {
-        syncCalls += 1;
-      },
     });
 
     expect(refreshCalls).toBe(1);
     expect(syncCalls).toBe(0);
-  });
-});
-
-describe('UsagePage sync action', () => {
-  it('triggers backend sync, refreshes active tab data, and reloads status', async () => {
-    const calls: string[] = [];
-    let receivedStatus: StatusResponse | null = null;
-    const syncStatus: StatusResponse = { running: true, sync_running: false, last_status: 'completed' };
-    const refreshedStatus: StatusResponse = {
-      running: true,
-      sync_running: false,
-      last_status: 'completed',
-      last_run_at: '2026-04-26T13:00:00.000Z',
-    };
-
-    await syncCpaData({
-      triggerBackendSync: async () => {
-        calls.push('sync');
-        return syncStatus;
-      },
-      refreshActiveTab: async () => {
-        calls.push('refresh');
-      },
-      refreshStatus: async () => {
-        calls.push('status');
-        return refreshedStatus;
-      },
-      onStatus: (status) => {
-        calls.push('set-status');
-        receivedStatus = status;
-      },
-    });
-
-    expect(calls).toEqual(['sync', 'refresh', 'status', 'set-status']);
-    expect(receivedStatus).toBe(refreshedStatus);
-  });
-
-  it('reloads status and preserves the sync error when backend sync fails', async () => {
-    const calls: string[] = [];
-    let receivedStatus: StatusResponse | null = null;
-    const refreshedStatus: StatusResponse = {
-      running: true,
-      sync_running: false,
-      last_status: 'completed',
-      last_run_at: '2026-04-26T13:00:00.000Z',
-    };
-    const syncError = new ApiError('metadata sync failed', 500);
-
-    await expect(syncCpaData({
-      triggerBackendSync: async () => {
-        calls.push('sync');
-        throw syncError;
-      },
-      refreshActiveTab: async () => {
-        calls.push('refresh');
-      },
-      refreshStatus: async () => {
-        calls.push('status');
-        return refreshedStatus;
-      },
-      onStatus: (status) => {
-        calls.push('set-status');
-        receivedStatus = status;
-      },
-    })).rejects.toBe(syncError);
-
-    expect(calls).toEqual(['sync', 'status', 'set-status']);
-    expect(receivedStatus).toBe(refreshedStatus);
   });
 });

@@ -1,4 +1,5 @@
 import type { UsageIdentity, UsageQuotaRow } from '@/lib/types'
+import { calculateCacheRate } from '@/utils/usage'
 
 export const CREDENTIALS_PAGE_SIZE = 10
 
@@ -117,6 +118,7 @@ export function buildAuthFileCredentialRows(
     const quota = quotas.get(identity.identity) ?? []
     const state = quotaStates.get(identity.identity)
     const displayQuotas = quota.map(toDisplayQuota)
+    const planType = firstNonEmpty(...quota.map((row) => row.planType), identity.plan_type)
     // 先挑 5h 主窗口，再挑 Weekly 次窗口，其余限额保留到 chips 中展示。
     const primaryQuota = displayQuotas.find(isPrimaryQuota)
     const secondaryQuota = displayQuotas.find((item) => item !== primaryQuota && isSecondaryQuota(item))
@@ -129,8 +131,8 @@ export function buildAuthFileCredentialRows(
       providerLabel: credentialProviderLabel(identity),
       typeLabel: credentialTypeLabel(identity),
       authTypeLabel: credentialAuthTypeLabel(identity),
-      planTypeLabel: credentialPlanTypeLabel(identity.plan_type),
-      planTypeTone: credentialPlanTypeTone(identity.plan_type),
+      planTypeLabel: credentialPlanTypeLabel(planType),
+      planTypeTone: credentialPlanTypeTone(planType),
       remainingDaysLabel: remainingDaysLabel(identity.active_until),
       totalRequests: safeNumber(identity.total_requests),
       successCount: safeNumber(identity.success_count),
@@ -246,10 +248,10 @@ function quotaStatus(row: UsageQuotaRow, percent: number | null, kind: DisplayQu
   if (remainingPercent === null) {
     return 'unknown'
   }
-  if (remainingPercent <= 10) {
+  if (remainingPercent < 20) {
     return 'danger'
   }
-  if (remainingPercent <= 25) {
+  if (remainingPercent < 50) {
     return 'warning'
   }
   return 'ok'
@@ -300,10 +302,8 @@ function credentialPlanTypeLabel(planType?: string): string | undefined {
   if (!tone) {
     return undefined
   }
-  if (tone === 'neutral') {
-    return firstNonEmpty(planType)
-  }
-  return tone.charAt(0).toUpperCase() + tone.slice(1)
+  const label = tone === 'neutral' ? firstNonEmpty(planType) : tone
+  return label ? label.charAt(0).toUpperCase() + label.slice(1) : undefined
 }
 
 function credentialPlanTypeTone(planType?: string): PlanTypeTone | undefined {
@@ -348,11 +348,11 @@ function successRate(identity: UsageIdentity): number | null {
 }
 
 function cacheRate(identity: UsageIdentity): number | null {
-  const inputTokens = safeNumber(identity.input_tokens)
-  if (inputTokens <= 0) {
-    return null
-  }
-  return (safeNumber(identity.cached_tokens) / inputTokens) * 100
+  return calculateCacheRate({
+    inputTokens: identity.input_tokens,
+    cachedTokens: identity.cached_tokens,
+    sourceType: identity.type,
+  })
 }
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {

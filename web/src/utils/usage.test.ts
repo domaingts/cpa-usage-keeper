@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildChartData, buildUsageFromDetails, filterUsageByWindow, filterUsageSnapshot, resolveUsageFilterWindow, sanitizeChartLines } from '@/utils/usage';
+import { buildChartData, buildUsageFromDetails, calculateCacheRate, calculateCost, filterUsageByWindow, filterUsageSnapshot, resolveUsageFilterWindow, sanitizeChartLines } from '@/utils/usage';
 import type { UsageSnapshot } from '@/lib/types';
 
 afterEach(() => {
@@ -189,6 +189,24 @@ describe('resolveUsageFilterWindow', () => {
     });
   });
 
+  it('resolves yesterday as the previous local day boundary', () => {
+    const nowMs = Date.parse('2026-04-23T12:34:56.000Z');
+    const expectedStart = new Date(nowMs);
+    expectedStart.setHours(0, 0, 0, 0);
+    expectedStart.setDate(expectedStart.getDate() - 1);
+    const expectedEnd = new Date(expectedStart);
+    expectedEnd.setDate(expectedEnd.getDate() + 1);
+    expectedEnd.setMilliseconds(expectedEnd.getMilliseconds() - 1);
+
+    const window = resolveUsageFilterWindow(usage, 'yesterday', { nowMs });
+
+    expect(window).toEqual({
+      startMs: expectedStart.getTime(),
+      endMs: expectedEnd.getTime(),
+      windowMinutes: 24 * 60,
+    });
+  });
+
   it('resolves 30d as a rolling thirty-day window', () => {
     const nowMs = Date.parse('2026-04-23T12:34:56.000Z');
 
@@ -205,5 +223,70 @@ describe('resolveUsageFilterWindow', () => {
 describe('sanitizeChartLines', () => {
   it('falls back to all when persisted lines no longer exist in the current overview payload', () => {
     expect(sanitizeChartLines(['stale-model'], ['gpt-5.4', 'gpt-5.4-mini'])).toEqual(['all']);
+  });
+});
+
+describe('calculateCost', () => {
+  const prices = { 'm': { prompt: 15, completion: 75, cache: 1.5 } };
+  const baseDetail = {
+    timestamp: '',
+    source: '',
+    auth_index: '',
+    failed: false,
+    latency_ms: 0,
+    __modelName: 'm',
+  };
+
+  it('treats input as containing cached for OpenAI-style providers', () => {
+    const cost = calculateCost(
+      {
+        ...baseDetail,
+        source_type: 'openai',
+        tokens: { input_tokens: 1000, output_tokens: 100, reasoning_tokens: 0, cached_tokens: 600, total_tokens: 1100 },
+      },
+      prices,
+    );
+    // promptTokens = 1000 - 600 = 400 → 400*15 + 100*75 + 600*1.5 = 6000+7500+900 = 14400 micro-units
+    expect(cost).toBeCloseTo((400 * 15 + 100 * 75 + 600 * 1.5) / 1_000_000, 9);
+  });
+
+  it('treats input as excluding cached for Anthropic-style providers', () => {
+    const cost = calculateCost(
+      {
+        ...baseDetail,
+        source_type: 'claude',
+        tokens: { input_tokens: 400, output_tokens: 100, reasoning_tokens: 0, cached_tokens: 600, total_tokens: 500 },
+      },
+      prices,
+    );
+    // promptTokens stays 400 (no subtraction) → same total as the OpenAI case for the same physical request
+    expect(cost).toBeCloseTo((400 * 15 + 100 * 75 + 600 * 1.5) / 1_000_000, 9);
+  });
+
+  it('matches anthropic provider name case-insensitively', () => {
+    const cost = calculateCost(
+      {
+        ...baseDetail,
+        source_type: 'Anthropic',
+        tokens: { input_tokens: 1, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 100, total_tokens: 1 },
+      },
+      prices,
+    );
+    // 用 anthropic 公式：promptTokens=1，不会被减成 0
+    expect(cost).toBeGreaterThan(0);
+  });
+});
+
+describe('calculateCacheRate', () => {
+  it('uses input tokens as the denominator for OpenAI-style providers', () => {
+    expect(calculateCacheRate({ inputTokens: 1000, cachedTokens: 250, sourceType: 'openai' })).toBe(25);
+  });
+
+  it('adds cached tokens to the denominator for Anthropic-style providers', () => {
+    expect(calculateCacheRate({ inputTokens: 400, cachedTokens: 600, sourceType: 'claude' })).toBe(60);
+  });
+
+  it('returns null when there is no cacheable input', () => {
+    expect(calculateCacheRate({ inputTokens: 0, cachedTokens: 0, sourceType: 'openai' })).toBeNull();
   });
 });

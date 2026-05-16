@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/timeutil"
 	"gorm.io/gorm"
 )
 
@@ -19,7 +20,7 @@ func backfillUsageIdentityStatsMigration(tx *gorm.DB) error {
 	}
 
 	var identities []entities.UsageIdentity
-	if err := tx.Find(&identities).Error; err != nil {
+	if err := tx.Select("id, auth_type, identity").Find(&identities).Error; err != nil {
 		return fmt.Errorf("list usage identities for stats backfill: %w", err)
 	}
 	for _, identity := range identities {
@@ -42,7 +43,7 @@ func backfillUsageIdentityStatsMigration(tx *gorm.DB) error {
 			"last_aggregated_usage_event_id": stats.MaxUsageEventID,
 		}
 		if stats.TotalRequests > 0 {
-			now := time.Now().UTC()
+			now := timeutil.NormalizeStorageTime(time.Now())
 			updates["stats_updated_at"] = now
 		}
 		if err := tx.Model(&entities.UsageIdentity{}).Where("id = ?", identity.ID).Updates(updates).Error; err != nil {
@@ -75,17 +76,21 @@ func aggregateUsageIdentityFullStats(tx *gorm.DB, identity entities.UsageIdentit
 		return stats, nil
 	}
 
-	var firstEvent entities.UsageEvent
+	var firstEvent struct {
+		Timestamp time.Time
+	}
 	firstQuery, _ := usageIdentityBackfillEventsQuery(tx.Model(&entities.UsageEvent{}), identity)
-	if err := firstQuery.Order("timestamp asc, id asc").First(&firstEvent).Error; err != nil {
+	if err := firstQuery.Select("timestamp").Order("timestamp asc, id asc").First(&firstEvent).Error; err != nil {
 		return stats, fmt.Errorf("find first usage identity event for %q: %w", identity.Identity, err)
 	}
 	firstUsedAt := firstEvent.Timestamp
 	stats.FirstUsedAt = &firstUsedAt
 
-	var lastEvent entities.UsageEvent
+	var lastEvent struct {
+		Timestamp time.Time
+	}
 	lastQuery, _ := usageIdentityBackfillEventsQuery(tx.Model(&entities.UsageEvent{}), identity)
-	if err := lastQuery.Order("timestamp desc, id desc").First(&lastEvent).Error; err != nil {
+	if err := lastQuery.Select("timestamp").Order("timestamp desc, id desc").First(&lastEvent).Error; err != nil {
 		return stats, fmt.Errorf("find last usage identity event for %q: %w", identity.Identity, err)
 	}
 	lastUsedAt := lastEvent.Timestamp

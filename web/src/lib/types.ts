@@ -1,5 +1,3 @@
-export const USAGE_QUOTA_REFRESH_LIMIT = 20
-
 export interface AuthSessionResponse {
   authenticated: boolean
 }
@@ -135,11 +133,13 @@ export interface UsageEventTokens {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
   total_tokens: number
 }
 
 export interface UsageEvent {
-  id?: number
+  id?: string
   timestamp: string
   model: string
   source: string
@@ -177,7 +177,7 @@ export interface UsageEventSourceFilterOptionsResponse {
 export type UsageIdentityAuthType = 1 | 2
 
 export interface UsageIdentity {
-  id: number
+  id: string
   name: string
   displayName?: string
   auth_type: UsageIdentityAuthType
@@ -196,7 +196,7 @@ export interface UsageIdentity {
   reasoning_tokens: number
   cached_tokens: number
   total_tokens: number
-  last_aggregated_usage_event_id: number
+  last_aggregated_usage_event_id: string
   first_used_at?: string
   last_used_at?: string
   stats_updated_at?: string
@@ -229,6 +229,7 @@ export interface UsageQuotaRow {
   label?: string
   scope?: string
   metric?: string
+  planType?: string
   used?: number
   limit?: number
   remaining?: number
@@ -278,37 +279,68 @@ export interface UsageQuotaRefreshResponse {
   limit: number
 }
 
-export interface UsageAnalysisModel {
-  model: string
-  total_requests: number
-  success_count: number
-  failure_count: number
+export interface AnalysisTokenUsageBucket {
+  bucket: string
   input_tokens: number
   output_tokens: number
-  reasoning_tokens: number
   cached_tokens: number
+  reasoning_tokens: number
   total_tokens: number
-  total_latency_ms: number
-  latency_sample_count: number
+  requests: number
 }
 
-export interface UsageAnalysisApi {
+export interface AnalysisCompositionItem {
+  key: string
+  label: string
+  total_tokens: number
+  requests: number
+  percent: number
+}
+
+export interface AnalysisHeatmapCell {
   api_key: string
-  display_name: string
-  total_requests: number
-  success_count: number
-  failure_count: number
-  input_tokens: number
-  output_tokens: number
-  reasoning_tokens: number
-  cached_tokens: number
+  model: string
   total_tokens: number
-  models: UsageAnalysisModel[]
+  requests: number
+  intensity: number
 }
 
-export interface UsageAnalysisResponse {
-  apis: UsageAnalysisApi[]
-  models: UsageAnalysisModel[]
+export interface AnalysisHeatmapPayload {
+  api_keys: string[]
+  models: string[]
+  cells: AnalysisHeatmapCell[]
+}
+
+export interface AnalysisResponse {
+  granularity: 'hourly' | 'daily'
+  timezone: string
+  range_start?: string
+  range_end?: string
+  token_usage: AnalysisTokenUsageBucket[]
+  api_key_composition: AnalysisCompositionItem[]
+  model_composition: AnalysisCompositionItem[]
+  heatmap: AnalysisHeatmapPayload
+}
+
+export interface CpaApiKeySettingsItem {
+  id: string
+  keyAlias: string
+  displayKey: string
+  label: string
+  lastSyncedAt: string | null
+}
+
+export interface CpaApiKeyOption {
+  id: string
+  label: string
+}
+
+export interface CpaApiKeysResponse {
+  items: CpaApiKeySettingsItem[]
+}
+
+export interface CpaApiKeyOptionsResponse {
+  options: CpaApiKeyOption[]
 }
 
 export interface PricingEntry {
@@ -326,7 +358,7 @@ export interface PricingResponse {
   pricing: PricingEntry[]
 }
 
-export type UsageTimeRange = 'all' | '4h' | '8h' | '12h' | '24h' | 'today' | '7d' | '30d' | 'custom'
+export type UsageTimeRange = '4h' | '8h' | '12h' | '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom'
 
 export interface UsageFilterWindow {
   startMs?: number

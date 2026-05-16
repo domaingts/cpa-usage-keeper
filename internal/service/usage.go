@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"strconv"
+	"strings"
 
 	"cpa-usage-keeper/internal/repository"
 	repodto "cpa-usage-keeper/internal/repository/dto"
@@ -17,6 +19,22 @@ func NewUsageService(db *gorm.DB) UsageProvider {
 	return &usageService{db: db}
 }
 
+func (s *usageService) resolveAPIGroupKey(apiKeyID string) (string, error) {
+	apiKeyID = strings.TrimSpace(apiKeyID)
+	if apiKeyID == "" {
+		return "", nil
+	}
+	parsedID, err := strconv.ParseInt(apiKeyID, 10, 64)
+	if err != nil || parsedID <= 0 {
+		return "", ErrInvalidID
+	}
+	apiKey, err := repository.FindActiveCPAAPIKeyByID(s.db, parsedID)
+	if err != nil {
+		return "", err
+	}
+	return apiKey.APIKey, nil
+}
+
 func (s *usageService) GetUsageWithFilter(_ context.Context, filter servicedto.UsageFilter) (*repodto.StatisticsSnapshot, error) {
 	return repository.BuildUsageSnapshotWithFilter(s.db, repodto.UsageQueryFilter{
 		Range:     filter.Range,
@@ -25,12 +43,17 @@ func (s *usageService) GetUsageWithFilter(_ context.Context, filter servicedto.U
 	})
 }
 
-// Usage 页面里的 Overview tab 只下传时间窗口，仓储层负责构建 overview 聚合。
+// Usage 页面里的 Overview tab 下传时间窗口和全局 API-Key，仓储层负责构建 overview 聚合。
 func (s *usageService) GetUsageOverview(_ context.Context, filter servicedto.UsageFilter) (*servicedto.UsageOverviewSnapshot, error) {
+	apiGroupKey, err := s.resolveAPIGroupKey(filter.APIKeyID)
+	if err != nil {
+		return nil, err
+	}
 	overview, err := repository.BuildUsageOverviewWithFilter(s.db, repodto.UsageQueryFilter{
-		Range:     filter.Range,
-		StartTime: filter.StartTime,
-		EndTime:   filter.EndTime,
+		Range:       filter.Range,
+		StartTime:   filter.StartTime,
+		EndTime:     filter.EndTime,
+		APIGroupKey: apiGroupKey,
 	})
 	if err != nil {
 		return nil, err
@@ -96,19 +119,97 @@ func mapUsageOverviewSeries(series repodto.UsageOverviewSeriesRecord) servicedto
 	}
 }
 
-// Usage 页面里的 Request Event Log tab 下传分页和列表筛选条件。
+func (s *usageService) GetAnalysis(_ context.Context, filter servicedto.UsageFilter) (*servicedto.AnalysisSnapshot, error) {
+	apiGroupKey, err := s.resolveAPIGroupKey(filter.APIKeyID)
+	if err != nil {
+		return nil, err
+	}
+	record, err := repository.BuildAnalysisWithFilter(s.db, repodto.UsageQueryFilter{
+		Range:       filter.Range,
+		StartTime:   filter.StartTime,
+		EndTime:     filter.EndTime,
+		APIGroupKey: apiGroupKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return mapAnalysisRecord(record), nil
+}
+
+func mapAnalysisRecord(record *repodto.AnalysisRecord) *servicedto.AnalysisSnapshot {
+	if record == nil {
+		return &servicedto.AnalysisSnapshot{}
+	}
+	tokenUsage := make([]servicedto.AnalysisTokenUsageBucket, 0, len(record.TokenUsage))
+	for _, bucket := range record.TokenUsage {
+		tokenUsage = append(tokenUsage, servicedto.AnalysisTokenUsageBucket{
+			Bucket:          bucket.Bucket,
+			InputTokens:     bucket.InputTokens,
+			OutputTokens:    bucket.OutputTokens,
+			CachedTokens:    bucket.CachedTokens,
+			ReasoningTokens: bucket.ReasoningTokens,
+			TotalTokens:     bucket.TotalTokens,
+			Requests:        bucket.Requests,
+		})
+	}
+	apiKeys := make([]servicedto.AnalysisCompositionItem, 0, len(record.APIKeyComposition))
+	for _, item := range record.APIKeyComposition {
+		apiKeys = append(apiKeys, mapAnalysisCompositionRecord(item))
+	}
+	models := make([]servicedto.AnalysisCompositionItem, 0, len(record.ModelComposition))
+	for _, item := range record.ModelComposition {
+		models = append(models, mapAnalysisCompositionRecord(item))
+	}
+	heatmap := make([]servicedto.AnalysisHeatmapCell, 0, len(record.Heatmap))
+	for _, cell := range record.Heatmap {
+		heatmap = append(heatmap, servicedto.AnalysisHeatmapCell{
+			APIKey:      cell.APIKey,
+			Model:       cell.Model,
+			TotalTokens: cell.TotalTokens,
+			Requests:    cell.Requests,
+		})
+	}
+	return &servicedto.AnalysisSnapshot{
+		Granularity:       servicedto.AnalysisGranularity(record.Granularity),
+		RangeStart:        record.RangeStart,
+		RangeEnd:          record.RangeEnd,
+		TokenUsage:        tokenUsage,
+		APIKeyComposition: apiKeys,
+		ModelComposition:  models,
+		Heatmap:           heatmap,
+	}
+}
+
+func mapAnalysisCompositionRecord(item repodto.AnalysisCompositionRecord) servicedto.AnalysisCompositionItem {
+	return servicedto.AnalysisCompositionItem{
+		Key:             item.Key,
+		TotalTokens:     item.TotalTokens,
+		Requests:        item.Requests,
+		InputTokens:     item.InputTokens,
+		OutputTokens:    item.OutputTokens,
+		CachedTokens:    item.CachedTokens,
+		ReasoningTokens: item.ReasoningTokens,
+	}
+}
+
+// Usage 页面里的 Request Event Log tab 下传分页、列表筛选条件和全局 API-Key。
 func (s *usageService) ListUsageEvents(_ context.Context, filter servicedto.UsageFilter) (*servicedto.UsageEventsPage, error) {
+	apiGroupKey, err := s.resolveAPIGroupKey(filter.APIKeyID)
+	if err != nil {
+		return nil, err
+	}
 	page, err := repository.ListUsageEventsWithFilter(s.db, repodto.UsageQueryFilter{
-		StartTime: filter.StartTime,
-		EndTime:   filter.EndTime,
-		Limit:     filter.Limit,
-		Page:      filter.Page,
-		PageSize:  filter.PageSize,
-		Offset:    filter.Offset,
-		Model:     filter.Model,
-		Source:    filter.Source,
-		AuthIndex: filter.AuthIndex,
-		Result:    filter.Result,
+		StartTime:   filter.StartTime,
+		EndTime:     filter.EndTime,
+		Limit:       filter.Limit,
+		Page:        filter.Page,
+		PageSize:    filter.PageSize,
+		Offset:      filter.Offset,
+		Model:       filter.Model,
+		Source:      filter.Source,
+		AuthIndex:   filter.AuthIndex,
+		APIGroupKey: apiGroupKey,
+		Result:      filter.Result,
 	})
 	if err != nil {
 		return nil, err
@@ -116,21 +217,23 @@ func (s *usageService) ListUsageEvents(_ context.Context, filter servicedto.Usag
 	result := make([]servicedto.UsageEventRecord, 0, len(page.Events))
 	for _, row := range page.Events {
 		result = append(result, servicedto.UsageEventRecord{
-			ID:              row.ID,
-			Timestamp:       row.Timestamp,
-			APIGroupKey:     row.APIGroupKey,
-			Model:           row.Model,
-			AuthType:        row.AuthType,
-			Provider:        row.Provider,
-			Source:          row.Source,
-			AuthIndex:       row.AuthIndex,
-			Failed:          row.Failed,
-			LatencyMS:       row.LatencyMS,
-			InputTokens:     row.InputTokens,
-			OutputTokens:    row.OutputTokens,
-			ReasoningTokens: row.ReasoningTokens,
-			CachedTokens:    row.CachedTokens,
-			TotalTokens:     row.TotalTokens,
+			ID:                  row.ID,
+			Timestamp:           row.Timestamp,
+			APIGroupKey:         row.APIGroupKey,
+			Model:               row.Model,
+			AuthType:            row.AuthType,
+			Provider:            row.Provider,
+			Source:              row.Source,
+			AuthIndex:           row.AuthIndex,
+			Failed:              row.Failed,
+			LatencyMS:           row.LatencyMS,
+			InputTokens:         row.InputTokens,
+			OutputTokens:        row.OutputTokens,
+			ReasoningTokens:     row.ReasoningTokens,
+			CachedTokens:        row.CachedTokens,
+			CacheReadTokens:     row.CacheReadTokens,
+			CacheCreationTokens: row.CacheCreationTokens,
+			TotalTokens:         row.TotalTokens,
 		})
 	}
 	return &servicedto.UsageEventsPage{Events: result, Models: page.Models, TotalCount: page.TotalCount, Page: page.Page, PageSize: page.PageSize, TotalPages: page.TotalPages}, nil
@@ -146,67 +249,4 @@ func (s *usageService) ListUsageEventFilterOptions(_ context.Context, filter ser
 		return nil, err
 	}
 	return &servicedto.UsageEventFilterOptions{Models: options.Models}, nil
-}
-
-// Usage 页面里的 Analysis tab 只下传时间窗口，仓储层负责按 API 和 model 聚合。
-func (s *usageService) GetUsageAnalysis(_ context.Context, filter servicedto.UsageFilter) (*servicedto.UsageAnalysisSnapshot, error) {
-	apiRows, modelRows, err := repository.ListUsageAnalysisWithFilter(s.db, repodto.UsageQueryFilter{
-		StartTime: filter.StartTime,
-		EndTime:   filter.EndTime,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	apis := make([]servicedto.UsageAnalysisAPIStat, 0, len(apiRows))
-	for _, row := range apiRows {
-		models := make([]servicedto.UsageAnalysisModelStat, 0, len(row.Models))
-		for _, model := range row.Models {
-			models = append(models, servicedto.UsageAnalysisModelStat{
-				Model:              model.Model,
-				TotalRequests:      model.TotalRequests,
-				SuccessCount:       model.SuccessCount,
-				FailureCount:       model.FailureCount,
-				TotalTokens:        model.TotalTokens,
-				InputTokens:        model.InputTokens,
-				OutputTokens:       model.OutputTokens,
-				ReasoningTokens:    model.ReasoningTokens,
-				CachedTokens:       model.CachedTokens,
-				TotalLatencyMS:     model.TotalLatencyMS,
-				LatencySampleCount: model.LatencySampleCount,
-			})
-		}
-		apis = append(apis, servicedto.UsageAnalysisAPIStat{
-			APIKey:          row.APIGroupKey,
-			DisplayName:     row.DisplayName,
-			TotalRequests:   row.TotalRequests,
-			SuccessCount:    row.SuccessCount,
-			FailureCount:    row.FailureCount,
-			TotalTokens:     row.TotalTokens,
-			InputTokens:     row.InputTokens,
-			OutputTokens:    row.OutputTokens,
-			ReasoningTokens: row.ReasoningTokens,
-			CachedTokens:    row.CachedTokens,
-			Models:          models,
-		})
-	}
-
-	models := make([]servicedto.UsageAnalysisModelStat, 0, len(modelRows))
-	for _, row := range modelRows {
-		models = append(models, servicedto.UsageAnalysisModelStat{
-			Model:              row.Model,
-			TotalRequests:      row.TotalRequests,
-			SuccessCount:       row.SuccessCount,
-			FailureCount:       row.FailureCount,
-			TotalTokens:        row.TotalTokens,
-			InputTokens:        row.InputTokens,
-			OutputTokens:       row.OutputTokens,
-			ReasoningTokens:    row.ReasoningTokens,
-			CachedTokens:       row.CachedTokens,
-			TotalLatencyMS:     row.TotalLatencyMS,
-			LatencySampleCount: row.LatencySampleCount,
-		})
-	}
-
-	return &servicedto.UsageAnalysisSnapshot{APIs: apis, Models: models}, nil
 }
