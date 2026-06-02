@@ -23,12 +23,16 @@ type UsageEventRecord struct {
 	Timestamp           time.Time
 	APIGroupKey         string
 	Model               string
+	ReasoningEffort     string
+	ExecutorType        string
+	Endpoint            string
 	AuthType            string
 	Provider            string
 	Source              string
 	AuthIndex           string
 	Failed              bool
 	LatencyMS           int64
+	TTFTMS              *int64
 	InputTokens         int64
 	OutputTokens        int64
 	ReasoningTokens     int64
@@ -36,4 +40,7 @@ type UsageEventRecord struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	CostUSD             float64
+	CostAvailable       bool
+	PricingStyle        string
 }

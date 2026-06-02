@@ -18,6 +18,7 @@ function identity(overrides: Partial<UsageIdentity>): UsageIdentity {
     identity: overrides.identity ?? 'auth-1',
     type: overrides.type ?? 'claude',
     provider: overrides.provider ?? 'claude',
+    priority: overrides.priority,
     plan_type: overrides.plan_type,
     total_requests: overrides.total_requests ?? 0,
     success_count: overrides.success_count ?? 0,
@@ -136,16 +137,17 @@ describe('credentialViewModels', () => {
     expect(thirdPage.items.map((item) => item.identity)).toEqual(['auth-21', 'auth-22', 'auth-23', 'auth-24', 'auth-25'])
   })
 
-  it('builds auth file rows with primary secondary and extra quota display data', () => {
+  it('builds auth file rows with displayable quota bars and ignores quota without progress', () => {
     const quotas = new Map<string, UsageQuotaRow[]>([
       ['auth-1', [
-        { key: 'rate_limit.primary_window', label: '5h', remainingFraction: 0.72, remaining: 72, resetAt: '2026-05-09T12:00:00Z' },
+        { key: 'rate_limit.primary_window', label: '5h', remainingFraction: 0.72, remaining: 72, resetAt: '2026-05-09T12:00:00Z', window_usage_tokens: 1_500_000, window_usage_cost: 12.34 },
         { key: 'rate_limit.secondary_window', label: 'Weekly', used: 40, limit: 100 },
+        { key: 'rate_limit.gpt_codex_spark_5h', label: 'GPT-5.3-Codex-Spark 5h', usedPercent: 83 },
         { key: 'code_assist.current_tier.GOOGLE_ONE_AI', label: 'Code Assist Credit', remaining: 10 },
       ]],
     ])
 
-    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1', displayName: 'Claude Auth', total_requests: 10, success_count: 9, input_tokens: 750, cached_tokens: 250, total_tokens: 1500 })], quotas)
+    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1', displayName: 'Claude Auth', total_requests: 10, success_count: 9, input_tokens: 1000, cached_tokens: 250, total_tokens: 1500 })], quotas)
 
     expect(rows[0].displayName).toBe('Claude Auth')
     expect(rows[0].typeLabel).toBe('claude')
@@ -154,21 +156,80 @@ describe('credentialViewModels', () => {
     expect(rows[0].failureCount).toBe(0)
     expect(rows[0].totalTokens).toBe(1500)
     expect(rows[0].cacheRate).toBe(25)
-    expect(rows[0].primaryQuota?.label).toBe('5h')
-    expect(rows[0].primaryQuota?.percent).toBe(72)
-    expect(rows[0].primaryQuota?.percentKind).toBe('remaining')
-    expect(rows[0].primaryQuota?.barPercent).toBe(72)
-    expect(rows[0].primaryQuota?.status).toBe('ok')
-    expect(rows[0].secondaryQuota?.label).toBe('Weekly')
-    expect(rows[0].secondaryQuota?.percent).toBe(40)
-    expect(rows[0].secondaryQuota?.percentKind).toBe('used')
-    expect(rows[0].secondaryQuota?.barPercent).toBe(60)
-    expect(rows[0].extraQuota.map((quota) => quota.label)).toEqual(['Code Assist Credit'])
+    expect(rows[0].displayQuotas.map((quota) => quota.label)).toEqual(['5h', 'Weekly', 'GPT-5.3-Codex-Spark 5h'])
+    expect(rows[0].displayQuotas[0]).toMatchObject({
+      percent: 72,
+      percentKind: 'remaining',
+      barPercent: 72,
+      status: 'ok',
+      windowUsage: { tokens: '1.50M', cost: '$12.34' },
+    })
+    expect(rows[0].displayQuotas[1]).toMatchObject({
+      percent: 40,
+      percentKind: 'used',
+      barPercent: 60,
+    })
+    expect(rows[0].displayQuotas[2]).toMatchObject({
+      percent: 83,
+      percentKind: 'used',
+      barPercent: 17,
+      status: 'danger',
+    })
   })
 
-  it('uses Claude token semantics for auth file cache rate', () => {
+  it('formats zero quota window cost with two decimals', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['auth-1', [
+        { key: 'rate_limit.primary_window', label: '5h', remainingFraction: 0.72, window_usage_tokens: 0, window_usage_cost: 0 },
+      ]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
+
+    expect(rows[0].displayQuotas[0].windowUsage).toEqual({ tokens: '0', cost: '$0.00' })
+  })
+
+  it('formats provider quota window usage with fixed compact units and US dollar decimals', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['auth-1', [
+        { key: 'rate_limit.primary_window', label: '5h', usedPercent: 3, window_usage_tokens: 11_368_055, window_usage_cost: 14.83442025 },
+        { key: 'additional_rate_limits.GPT-5.3-Codex-Spark.primary_window', label: 'GPT-5.3-Codex-Spark 5h', usedPercent: 0, window_usage_tokens: 393_311, window_usage_cost: 0.458464 },
+      ]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
+
+    expect(rows[0].displayQuotas.map((quota) => quota.windowUsage)).toEqual([
+      { tokens: '11.37M', cost: '$14.83' },
+      { tokens: '393.31K', cost: '$0.46' },
+    ])
+  })
+
+  it('uses an explicit US locale for quota window cost formatting', () => {
+    const numberFormatSpy = vi.spyOn(Intl, 'NumberFormat')
+    try {
+      const quotas = new Map<string, UsageQuotaRow[]>([
+        ['auth-1', [
+          { key: 'rate_limit.primary_window', label: '5h', usedPercent: 3, window_usage_tokens: 11_368_055, window_usage_cost: 14.83442025 },
+        ]],
+      ])
+
+      buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
+
+      expect(numberFormatSpy).toHaveBeenCalledWith('en-US', expect.objectContaining({
+        style: 'currency',
+        currency: 'USD',
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }))
+    } finally {
+      numberFormatSpy.mockRestore()
+    }
+  })
+
+  it('uses normalized input token semantics for auth file cache rate', () => {
     const rows = buildAuthFileCredentialRows([
-      identity({ identity: 'auth-claude', type: 'claude', input_tokens: 400, cached_tokens: 600 }),
+      identity({ identity: 'auth-claude', type: 'claude', input_tokens: 1000, cached_tokens: 600 }),
     ])
 
     expect(rows[0].cacheRate).toBe(60)
@@ -187,7 +248,7 @@ describe('credentialViewModels', () => {
       identity({ identity: 'red-auth' }),
     ], quotas)
 
-    expect(rows.map((row) => row.primaryQuota?.status)).toEqual(['ok', 'warning', 'danger'])
+    expect(rows.map((row) => row.displayQuotas[0]?.status)).toEqual(['ok', 'warning', 'danger'])
   })
 
   it('uses quota window duration instead of raw key when classifying Codex windows', () => {
@@ -199,23 +260,65 @@ describe('credentialViewModels', () => {
 
     const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
 
-    expect(rows[0].primaryQuota).toBeUndefined()
-    expect(rows[0].secondaryQuota?.label).toBe('Weekly')
-    expect(rows[0].secondaryQuota?.barPercent).toBe(90)
+    expect(rows[0].displayQuotas[0]?.label).toBe('Weekly')
+    expect(rows[0].displayQuotas[0]?.barPercent).toBe(90)
   })
 
-  it('does not classify unknown Codex windows as 5h or weekly', () => {
+  it('uses monthly quota labels for 30 day Codex windows', () => {
     const quotas = new Map<string, UsageQuotaRow[]>([
       ['auth-1', [
-        { key: 'rate_limit.primary_window', label: '5h', usedPercent: 10, window: { seconds: 3600 } },
+        { key: 'rate_limit.primary_window', label: '5h', usedPercent: 20, window: { seconds: 2592000 } },
+        { key: 'code_review_rate_limit.primary_window', label: 'Code Review Weekly', usedPercent: 40, window: { seconds: 2592000 } },
+        { key: 'additional_rate_limits.GPT-5.3-Codex-Spark.primary_window', label: 'GPT-5.3-Codex-Spark 5h', usedPercent: 60, window: { seconds: 2592000 } },
       ]],
     ])
 
     const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
 
-    expect(rows[0].primaryQuota).toBeUndefined()
-    expect(rows[0].secondaryQuota).toBeUndefined()
-    expect(rows[0].extraQuota[0].label).toBe('Window')
+    expect(rows[0].displayQuotas.map((quota) => quota.label)).toEqual(['Monthly', 'Code Review Monthly', 'GPT-5.3-Codex-Spark Monthly'])
+    expect(rows[0].displayQuotas.map((quota) => quota.barPercent)).toEqual([80, 60, 40])
+  })
+
+  it('keeps unknown Codex windows displayable without showing a generic Window quota', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['auth-1', [
+        { key: 'rate_limit.primary_window', label: 'Window', usedPercent: 10, window: { seconds: 3600 } },
+        { key: 'additional_rate_limits.GPT-5.3-Codex-Spark.primary_window', label: 'GPT-5.3-Codex-Spark 5h', usedPercent: 83, window: { seconds: 3600 } },
+      ]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
+
+    expect(rows[0].displayQuotas.map((quota) => quota.label)).toEqual(['Primary', 'GPT-5.3-Codex-Spark Primary'])
+    expect(rows[0].displayQuotas.map((quota) => quota.barPercent)).toEqual([90, 17])
+  })
+
+  it('maps legacy generic Window quota labels by Codex window role even without seconds', () => {
+    const quotas = new Map<string, UsageQuotaRow[]>([
+      ['auth-1', [
+        { key: 'rate_limit.primary_window', label: 'Window', usedPercent: 10 },
+        { key: 'code_review_rate_limit.secondary_window', label: 'Code Review Window', usedPercent: 30 },
+      ]],
+    ])
+
+    const rows = buildAuthFileCredentialRows([identity({ identity: 'auth-1' })], quotas)
+
+    expect(rows[0].displayQuotas.map((quota) => quota.label)).toEqual(['Primary', 'Code Review Secondary'])
+    expect(rows[0].displayQuotas.map((quota) => quota.barPercent)).toEqual([90, 70])
+  })
+
+  it('builds compact priority labels for auth files and AI providers', () => {
+    const authFileRows = buildAuthFileCredentialRows([
+      identity({ identity: 'priority-auth', priority: 5 }),
+      identity({ identity: 'zero-priority-auth', priority: 0 }),
+      identity({ identity: 'default-auth' }),
+    ])
+    const aiProviderRows = buildAiProviderCredentialRows([
+      identity({ auth_type: 2, identity: 'priority-provider', priority: 7 }),
+    ])
+
+    expect(authFileRows.map((row) => row.priorityLabel)).toEqual(['P5', 'P0', undefined])
+    expect(aiProviderRows[0].priorityLabel).toBe('P7')
   })
 
   it('builds AI provider rows without quota data', () => {
@@ -231,6 +334,6 @@ describe('credentialViewModels', () => {
     expect(rows[0].successRate).toBe(75)
     expect(rows[0].totalTokens).toBe(0)
     expect(rows[0].cacheRate).toBeNull()
-    expect('primaryQuota' in rows[0]).toBe(false)
+    expect('displayQuotas' in rows[0]).toBe(false)
   })
 })

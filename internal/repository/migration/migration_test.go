@@ -44,6 +44,14 @@ func TestOrderedMigrationsPreservesExecutionOrder(t *testing.T) {
 		"20260514_add_usage_event_plain_dimension_indexes",
 		"20260514_create_usage_overview_stats",
 		"20260514_remove_usage_event_event_key_unique_index",
+		"20260517_add_usage_identity_sync_metadata_fields",
+		"20260518_usage_overview_rollup_dimensions",
+		"20260519_add_usage_event_reasoning_effort",
+		"20260525_add_usage_event_quota_window_indexes",
+		"20260528_add_usage_event_cpa_response_fields",
+		"20260531_model_price_pricing_style",
+		"20260601_backfill_claude_usage_tokens",
+		"20260602_add_usage_event_executor_type",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected ordered migrations %v, got %v", want, got)
@@ -65,7 +73,7 @@ func TestOpenDatabaseRunsSchemaMigrationsAndAddsUsageEventRedisFields(t *testing
 	if !db.Migrator().HasTable("schema_migrations") {
 		t.Fatal("expected schema_migrations table to exist")
 	}
-	for _, column := range []string{"provider", "endpoint", "auth_type", "request_id"} {
+	for _, column := range []string{"provider", "endpoint", "auth_type", "request_id", "executor_type"} {
 		if !db.Migrator().HasColumn(&entities.UsageEvent{}, column) {
 			t.Fatalf("expected usage_events.%s column to exist", column)
 		}
@@ -104,6 +112,14 @@ func TestOpenDatabaseRunsSchemaMigrationsAndAddsUsageEventRedisFields(t *testing
 		"20260514_add_usage_event_plain_dimension_indexes",
 		"20260514_create_usage_overview_stats",
 		"20260514_remove_usage_event_event_key_unique_index",
+		"20260517_add_usage_identity_sync_metadata_fields",
+		"20260518_usage_overview_rollup_dimensions",
+		"20260519_add_usage_event_reasoning_effort",
+		"20260525_add_usage_event_quota_window_indexes",
+		"20260528_add_usage_event_cpa_response_fields",
+		"20260531_model_price_pricing_style",
+		"20260601_backfill_claude_usage_tokens",
+		"20260602_add_usage_event_executor_type",
 	}
 	if len(versions) != len(expected) {
 		t.Fatalf("expected migration versions %v, got %v", expected, versions)
@@ -244,6 +260,33 @@ func assertRawMigrationTime(t *testing.T, db *gorm.DB, table string, field strin
 			t.Fatalf("expected %s.%s = %q, got NULL", table, field, want)
 		}
 		t.Fatalf("expected %s.%s = %q, got %q", table, field, want, *got)
+	}
+}
+
+func TestRunSchemaMigrationKeepsDefaultMigrationsTransactional(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(testSQLiteDSN(filepath.Join(t.TempDir(), "app.db"))), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer closeOpenedDatabase(t, db)
+	if err := db.Exec("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at DATETIME NOT NULL)").Error; err != nil {
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+
+	err = runSchemaMigration(db, databaseMigration{
+		version: "test_transactional_failure",
+		run: func(tx *gorm.DB) error {
+			if err := tx.Exec("CREATE TABLE transactional_probe (id INTEGER PRIMARY KEY)").Error; err != nil {
+				return err
+			}
+			return fmt.Errorf("boom")
+		},
+	})
+	if err == nil {
+		t.Fatal("expected migration error")
+	}
+	if db.Migrator().HasTable("transactional_probe") {
+		t.Fatal("expected default schema migration to roll back created table")
 	}
 }
 

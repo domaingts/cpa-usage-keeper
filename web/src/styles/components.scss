@@ -378,6 +378,7 @@ textarea {
   justify-content: center;
   z-index: $z-modal;
   padding: $spacing-lg;
+  overscroll-behavior: contain;
 
   &.modal-overlay-entering {
     animation: modal-overlay-fade-in 0.25s ease-out forwards;
@@ -512,6 +513,7 @@ textarea {
 .modal-body {
   padding: $spacing-lg;
   overflow: auto;
+  overscroll-behavior: contain;
   max-height: 65vh;
 }
 

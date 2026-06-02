@@ -1,9 +1,14 @@
 import { useTranslation } from 'react-i18next'
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner'
 import { IconRefreshCw } from '@/components/ui/icons'
+import quotaCostIcon from '@/assets/icons/quota-cost.svg'
+import quotaTokenIcon from '@/assets/icons/quota-token.svg'
 import styles from './CredentialSections.module.scss'
 import type { AuthFileCredentialRow, DisplayQuota, PlanTypeTone } from './credentialViewModels'
-import { CredentialBadge, CredentialRowShell, CredentialSectionShell, CredentialsPagination, MetricPill, RequestMetric, TonePercent, cacheRateTone, capitalize, credentialToneClassName, formatCredentialNumber, successRateTone } from './CredentialSectionShell'
+import type { UsageIdentityPageSort } from '@/lib/api'
+import { CredentialBadge, CredentialPriorityBadge, CredentialRowShell, CredentialSectionShell, CredentialsPagination, MetricPill, RequestMetric, TonePercent, cacheRateTone, capitalize, credentialToneClassName, formatCredentialNumber, successRateTone } from './CredentialSectionShell'
+
+type Translate = (key: string, options?: Record<string, string>) => string
 
 interface AuthFileCredentialsSectionProps {
   rows: AuthFileCredentialRow[]
@@ -11,16 +16,20 @@ interface AuthFileCredentialsSectionProps {
   page: number
   totalPages: number
   pageSize: number
+  activeOnly: boolean
+  sort: UsageIdentityPageSort
   loading: boolean
   quotaRefreshing: boolean
   quotaRefreshError: string
   onPageChange: (page: number) => void
   onPageSizeChange: (pageSize: number) => void
+  onActiveOnlyChange: (activeOnly: boolean) => void
+  onSortChange: (sort: UsageIdentityPageSort) => void
   onRefreshQuota: () => Promise<void>
   onRefreshQuotaForAuthIndex: (authIndex: string) => Promise<void>
 }
 
-export function AuthFileCredentialsSection({ rows, total, page, totalPages, pageSize, loading, quotaRefreshing, quotaRefreshError, onPageChange, onPageSizeChange, onRefreshQuota, onRefreshQuotaForAuthIndex }: AuthFileCredentialsSectionProps) {
+export function AuthFileCredentialsSection({ rows, total, page, totalPages, pageSize, activeOnly, sort, loading, quotaRefreshing, quotaRefreshError, onPageChange, onPageSizeChange, onActiveOnlyChange, onSortChange, onRefreshQuota, onRefreshQuotaForAuthIndex }: AuthFileCredentialsSectionProps) {
   const { t } = useTranslation()
   const canRefresh = rows.some((row) => !isRowRefreshing(row) && !row.identity.is_deleted) && !quotaRefreshing
 
@@ -30,6 +39,12 @@ export function AuthFileCredentialsSection({ rows, total, page, totalPages, page
       title={t('usage_stats.credentials_auth_files_title')}
       subtitle={t('usage_stats.credentials_auth_files_subtitle')}
       countLabel={t('usage_stats.credentials_count', { count: total })}
+      titleExtra={(
+        <label className={styles.credentialActiveOnlySwitch}>
+          <input type="checkbox" checked={activeOnly} onChange={(event) => onActiveOnlyChange(event.target.checked)} />
+          <span>{t('usage_stats.credentials_auth_files_active_only')}</span>
+        </label>
+      )}
       actions={(
         <div className={styles.credentialRefreshSwitcher}>
           <button
@@ -62,6 +77,7 @@ export function AuthFileCredentialsSection({ rows, total, page, totalPages, page
                 <CredentialBadge>{row.typeLabel}</CredentialBadge>
                 {row.planTypeLabel && <CredentialPlanBadge tone={row.planTypeTone}>{row.planTypeLabel}</CredentialPlanBadge>}
                 {row.remainingDaysLabel && <span className={styles.credentialRemainingDaysBadge}>{row.remainingDaysLabel}</span>}
+                {row.priorityLabel && <CredentialPriorityBadge>{row.priorityLabel}</CredentialPriorityBadge>}
               </span>
             )}
             badges={null}
@@ -94,13 +110,22 @@ export function AuthFileCredentialsSection({ rows, total, page, totalPages, page
       })}
       <CredentialsPagination
         page={page}
+        total={total}
         totalPages={totalPages}
         pageSize={pageSize}
+        sortValue={sort}
+        sortLabel={t('usage_stats.credentials_sort_label')}
+        sortOptions={[
+          { value: 'priority', label: t('usage_stats.credentials_sort_priority') },
+          { value: 'total_requests', label: t('usage_stats.credentials_sort_total_requests') },
+          { value: 'total_tokens', label: t('usage_stats.credentials_sort_total_tokens') },
+        ]}
         previousLabel={t('usage_stats.previous_page')}
         nextLabel={t('usage_stats.next_page')}
         rowsPerPageLabel={t('usage_stats.rows_per_page')}
         onPageChange={onPageChange}
         onPageSizeChange={onPageSizeChange}
+        onSortChange={(nextSort) => onSortChange(nextSort as UsageIdentityPageSort)}
       />
     </CredentialSectionShell>
   )
@@ -127,27 +152,16 @@ function AuthFileQuotaPanel({ row }: { row: AuthFileCredentialRow }) {
   if (row.refreshStatus === 'queued' || row.refreshStatus === 'running') {
     return <div className={styles.credentialQuotaRefreshStatus}>{t(`usage_stats.credentials_refresh_status_${row.refreshStatus}`)}</div>
   }
-  if (!row.primaryQuota && !row.secondaryQuota && row.extraQuota.length === 0) {
+  if (row.displayQuotas.length === 0) {
     return <div className={styles.credentialQuotaState}>{t('usage_stats.credentials_quota_unavailable')}</div>
   }
 
   return (
     <div className={styles.credentialQuotaPanel}>
       <div className={styles.credentialQuotaBars}>
-        {/* 主/次窗口固定优先展示，额外窗口放到下方 chips，避免宽度被无限撑开。 */}
-        {row.primaryQuota && <QuotaBar quota={row.primaryQuota} />}
-        {row.secondaryQuota && <QuotaBar quota={row.secondaryQuota} />}
+        {/* 每个可计算进度的 quota 都独占一个稳定块；不可进度化 quota 在 view model 中已过滤。 */}
+        {row.displayQuotas.map((quota) => <QuotaBar key={quota.key} quota={quota} />)}
       </div>
-      {row.extraQuota.length > 0 && (
-        <div className={styles.credentialQuotaChips}>
-          {row.extraQuota.map((quota) => (
-            <span key={quota.key} className={styles.credentialQuotaChip}>
-              <span>{quota.label}</span>
-              {quota.remaining !== undefined && <strong>{formatCredentialNumber(quota.remaining)}</strong>}
-            </span>
-          ))}
-        </div>
-      )}
     </div>
   )
 }
@@ -158,25 +172,40 @@ export function formatQuotaResetLabel(resetAt: string): string {
   if (!Number.isFinite(resetMs)) {
     return ''
   }
-  const remainingMinutes = Math.max(0, Math.ceil((resetMs - Date.now()) / 60_000))
-  const days = Math.floor(remainingMinutes / 1_440)
-  const hours = Math.floor((remainingMinutes % 1_440) / 60)
-  const minutes = remainingMinutes % 60
   const month = String(resetTime.getMonth() + 1).padStart(2, '0')
   const day = String(resetTime.getDate()).padStart(2, '0')
   const hour = String(resetTime.getHours()).padStart(2, '0')
   const minute = String(resetTime.getMinutes()).padStart(2, '0')
-  const duration = days > 0 ? `${days}d${hours}h${minutes}m` : `${hours}h${minutes}m`
-  return `${duration} (${month}/${day} ${hour}:${minute})`
+  return `${month}/${day} ${hour}:${minute}`
+}
+
+export function formatQuotaResetDuration(resetAt: string): string {
+  const resetMs = new Date(resetAt).getTime()
+  if (!Number.isFinite(resetMs)) {
+    return ''
+  }
+  const remainingMinutes = Math.max(0, Math.ceil((resetMs - Date.now()) / 60_000))
+  const days = Math.floor(remainingMinutes / 1_440)
+  const hours = Math.floor((remainingMinutes % 1_440) / 60)
+  const minutes = remainingMinutes % 60
+  return days > 0 ? `${days}d${hours}h${minutes}m` : `${hours}h${minutes}m`
+}
+
+export function formatQuotaWindowUsageAriaLabel(t: Translate, windowUsage: NonNullable<DisplayQuota['windowUsage']>): string {
+  return t('usage_stats.credentials_quota_window_usage_aria', {
+    tokens: windowUsage.tokens,
+    cost: windowUsage.cost,
+  })
 }
 
 function QuotaBar({ quota }: { quota: DisplayQuota }) {
-  // 条宽使用剩余额度百分比，颜色跟随剩余风险状态从绿到黄到红。
   const { t } = useTranslation()
+  // 条宽使用剩余额度百分比，颜色跟随剩余风险状态从绿到黄到红。
   const percent = quota.barPercent ?? 0
   const width = `${Math.max(0, Math.min(100, percent))}%`
-  const percentLabel = quota.barPercent === null ? '' : t('usage_stats.credentials_quota_percent_remaining', { percent: `${Math.round(quota.barPercent)}%` })
+  const percentLabel = quota.barPercent === null ? '' : `${Math.round(quota.barPercent)}%`
   const resetLabel = quota.resetText ? formatQuotaResetLabel(quota.resetText) : ''
+  const resetDuration = quota.resetText ? formatQuotaResetDuration(quota.resetText) : ''
 
   return (
     <div className={styles.credentialQuotaBarBlock}>
@@ -184,9 +213,10 @@ function QuotaBar({ quota }: { quota: DisplayQuota }) {
         <span className={styles.credentialQuotaLabelGroup}>
           <span>{quota.label}</span>
         </span>
-        {percentLabel && (
+        {(resetDuration || percentLabel) && (
           <span className={styles.credentialQuotaValueGroup}>
-            <strong>{percentLabel}</strong>
+            {resetDuration && <span className={styles.credentialQuotaResetDuration}>{resetDuration}</span>}
+            {percentLabel && <strong>{percentLabel}</strong>}
           </span>
         )}
       </div>
@@ -194,6 +224,18 @@ function QuotaBar({ quota }: { quota: DisplayQuota }) {
         <span className={`${styles.credentialQuotaFill} ${credentialToneClassName('credentialQuotaFill', quota.status)}`.trim()} style={{ width }} />
       </div>
       <div className={styles.credentialQuotaMeta}>
+        {quota.windowUsage && (
+          <strong className={styles.credentialQuotaWindowUsage} aria-label={formatQuotaWindowUsageAriaLabel(t, quota.windowUsage)}>
+            <span className={styles.credentialQuotaUsageMetric}>
+              <img src={quotaTokenIcon} alt="" aria-hidden="true" />
+              <span>{quota.windowUsage.tokens}</span>
+            </span>
+            <span className={styles.credentialQuotaUsageMetric}>
+              <img src={quotaCostIcon} alt="" aria-hidden="true" />
+              <span>{quota.windowUsage.cost}</span>
+            </span>
+          </strong>
+        )}
         {resetLabel && <span>{resetLabel}</span>}
       </div>
     </div>

@@ -5,18 +5,25 @@ import (
 
 	"cpa-usage-keeper/internal/entities"
 	"cpa-usage-keeper/internal/repository"
+	repodto "cpa-usage-keeper/internal/repository/dto"
 	"gorm.io/gorm"
 )
 
 type ListUsageIdentitiesRequest struct {
-	AuthType *entities.UsageIdentityAuthType
-	Page     int
-	PageSize int
+	AuthType   *entities.UsageIdentityAuthType
+	ActiveOnly *bool
+	Types      []string
+	Sort       string
+	Page       int
+	PageSize   int
 }
 
+type UsageIdentityTypeCount = repodto.UsageIdentityTypeCount
+
 type ListUsageIdentitiesResponse struct {
-	Items []entities.UsageIdentity
-	Total int64
+	Items      []entities.UsageIdentity
+	Total      int64
+	TypeCounts []UsageIdentityTypeCount
 }
 
 type UsageIdentityProvider interface {
@@ -44,13 +51,16 @@ func (s *usageIdentityService) ListActiveUsageIdentities(ctx context.Context) ([
 }
 
 func (s *usageIdentityService) ListActiveUsageIdentitiesPage(ctx context.Context, request ListUsageIdentitiesRequest) (ListUsageIdentitiesResponse, error) {
-	items, total, err := repository.ListActiveUsageIdentitiesPage(ctx, s.db, repository.ListUsageIdentitiesPageRequest{
-		AuthType: request.AuthType,
-		Page:     request.Page,
-		PageSize: request.PageSize,
+	items, total, typeCounts, err := repository.ListActiveUsageIdentitiesPage(ctx, s.db, repository.ListUsageIdentitiesPageRequest{
+		AuthType:   request.AuthType,
+		ActiveOnly: request.ActiveOnly,
+		Types:      request.Types,
+		Sort:       request.Sort,
+		Page:       request.Page,
+		PageSize:   request.PageSize,
 	})
 	if err != nil {
 		return ListUsageIdentitiesResponse{}, err
 	}
-	return ListUsageIdentitiesResponse{Items: items, Total: total}, nil
+	return ListUsageIdentitiesResponse{Items: items, Total: total, TypeCounts: typeCounts}, nil
 }

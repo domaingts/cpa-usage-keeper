@@ -12,15 +12,6 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestMaskAPIKeyUsesThreeCharacterPrefixAndSixCharacterSuffix(t *testing.T) {
-	if got := MaskAPIKey("sk-abcdef123456"); got != "sk-*********123456" {
-		t.Fatalf("unexpected masked key: %s", got)
-	}
-	if got := MaskAPIKey("short"); got != "*********" {
-		t.Fatalf("short key should be fully masked, got %s", got)
-	}
-}
-
 func TestSyncCPAAPIKeysCreatesRowsWithDisplayKeyAndEmptyAlias(t *testing.T) {
 	db := openCPAAPIKeyTestDatabase(t)
 	syncedAt := time.Date(2026, 5, 13, 10, 0, 0, 0, time.UTC)
@@ -122,6 +113,15 @@ func TestCPAAPIKeyQueriesFilterDeletedRows(t *testing.T) {
 	_, err = FindActiveCPAAPIKeyByID(db, 2)
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("expected deleted id to be hidden, got %v", err)
+	}
+
+	row, err := FindActiveCPAAPIKeyByValue(db, "sk-alpha123456")
+	if err != nil || row.ID != 1 {
+		t.Fatalf("expected active key lookup by value to return row 1, got %+v err=%v", row, err)
+	}
+	_, err = FindActiveCPAAPIKeyByValue(db, "sk-beta654321")
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("expected deleted value lookup to be hidden, got %v", err)
 	}
 }
 

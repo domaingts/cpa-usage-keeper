@@ -15,7 +15,6 @@ import (
 	"cpa-usage-keeper/internal/cpa/dto/authfiles"
 	"cpa-usage-keeper/internal/cpa/dto/providerconfig"
 	"cpa-usage-keeper/internal/cpa/dto/response"
-	"cpa-usage-keeper/internal/repository/dto"
 	servicedto "cpa-usage-keeper/internal/service/dto"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -37,7 +36,10 @@ type CPAClientFetcher interface {
 	MetadataFetcher
 }
 
-const redisInboxProcessLimit = 1000
+const (
+	redisInboxProcessLimit                = 1000
+	redisUsageIdentityTypeLookupBatchSize = 500
+)
 
 const (
 	syncMetadataOptional = false
@@ -150,8 +152,7 @@ func (s *SyncService) SyncMetadata(ctx context.Context) error {
 	return err
 }
 
-// PullRedisUsageInbox 是 Redis 同步的拉取阶段：只 LPOP 队列消息并原样写入 redis_usage_inboxes。
-// 这个阶段不解码消息、不写 usage_events，保证 Redis 消费和本地处理职责分离。
+// PullRedisUsageInbox 是兼容测试和手动同步的旧拉取入口；生产远端 ingest 已由 poller 状态机接管。
 func (s *SyncService) PullRedisUsageInbox(ctx context.Context) (*servicedto.RedisInboxPullResult, error) {
 	if err := s.validate(syncMetadataOptional); err != nil {
 		return nil, err
@@ -159,8 +160,6 @@ func (s *SyncService) PullRedisUsageInbox(ctx context.Context) (*servicedto.Redi
 	if s.redisQueue == nil {
 		return nil, fmt.Errorf("sync service redis queue is nil")
 	}
-
-	// LPOP 成功即代表远端队列已消费，所以必须先把原始消息持久化到 inbox。
 	fetchedAt := timeutil.NormalizeStorageTime(s.now())
 	messages, err := s.redisQueue.PopUsage(ctx)
 	if err != nil {
@@ -173,8 +172,6 @@ func (s *SyncService) PullRedisUsageInbox(ctx context.Context) (*servicedto.Redi
 	if len(messages) == 0 {
 		return &servicedto.RedisInboxPullResult{Empty: true, Status: "empty"}, nil
 	}
-
-	// inbox 行是本地 durable buffer，process runner 后续按状态重试，不再依赖 Redis 原始队列。
 	inboxRows, err := insertRedisInboxMessages(s.db, s.redisQueueKey, messages, fetchedAt)
 	if err != nil {
 		return &servicedto.RedisInboxPullResult{Status: "failed"}, fmt.Errorf("insert redis usage inbox: %w", err)
@@ -266,6 +263,14 @@ func (s *SyncService) processRedisInboxRows(ctx context.Context, inboxRows []ent
 		}
 		return &servicedto.RedisBatchSyncResult{Empty: true, Status: "empty"}, nil
 	}
+	var typeErr error
+	events, typeErr = normalizeRedisUsageEvents(ctx, s.db, events)
+	if typeErr != nil {
+		// type 查询失败代表当前无法可靠判断 provider 口径，不能当作“找不到 type”降级处理。
+		// 将已解码行标记为 process_failed，后续重试时再按真实 type 归一化入库。
+		markRedisInboxRowsProcessFailed(s.db, validRows, typeErr)
+		return &servicedto.RedisBatchSyncResult{Status: "failed"}, joinErrors(decodeErr, typeErr)
+	}
 
 	// usage_events 入库和 inbox processed 标记必须同事务提交，避免标记失败后同一 inbox 重试造成重复事件。
 	logrus.WithField("event_count", len(events)).Debug("redis usage events persistence started")
@@ -323,6 +328,130 @@ func (s *SyncService) processRedisInboxRows(ctx context.Context, inboxRows []ent
 	}, returnErr
 }
 
+type usageEventTypeResolver struct {
+	byAuthIndex map[string]string
+}
+
+func normalizeRedisUsageEvents(ctx context.Context, db *gorm.DB, events []entities.UsageEvent) ([]entities.UsageEvent, error) {
+	resolver, err := buildUsageEventTypeResolver(ctx, db, events)
+	if err != nil {
+		return nil, err
+	}
+	normalized := make([]entities.UsageEvent, len(events))
+	for i, event := range events {
+		usageType := resolveUsageEventType(event, resolver)
+		if usageType == "" {
+			logrus.WithFields(logrus.Fields{
+				"auth_type":  event.AuthType,
+				"auth_index": event.AuthIndex,
+				"event_key":  event.EventKey,
+			}).Warn("usage identity type not found for redis usage event")
+			usageType = "openai"
+		}
+		normalized[i] = NormalizeUsageEventTokens(event, usageType)
+	}
+	return normalized, nil
+}
+
+func buildUsageEventTypeResolver(ctx context.Context, db *gorm.DB, events []entities.UsageEvent) (usageEventTypeResolver, error) {
+	resolver := usageEventTypeResolver{byAuthIndex: map[string]string{}}
+	authIndexes := redisUsageAPIKeyAuthIndexes(events)
+	if len(authIndexes) == 0 {
+		return resolver, nil
+	}
+	if db == nil {
+		return resolver, fmt.Errorf("database is nil")
+	}
+	activeRows, err := loadRedisUsageIdentityTypeRows(ctx, db, authIndexes, false)
+	if err != nil {
+		return resolver, fmt.Errorf("load active usage identity types for redis usage: %w", err)
+	}
+	addRedisUsageIdentityTypes(resolver.byAuthIndex, activeRows)
+
+	missing := missingRedisUsageAuthIndexes(authIndexes, resolver.byAuthIndex)
+	if len(missing) == 0 {
+		return resolver, nil
+	}
+	deletedRows, err := loadRedisUsageIdentityTypeRows(ctx, db, missing, true)
+	if err != nil {
+		return resolver, fmt.Errorf("load deleted usage identity types for redis usage: %w", err)
+	}
+	addRedisUsageIdentityTypes(resolver.byAuthIndex, deletedRows)
+	return resolver, nil
+}
+
+func loadRedisUsageIdentityTypeRows(ctx context.Context, db *gorm.DB, authIndexes []string, isDeleted bool) ([]entities.UsageIdentity, error) {
+	rows := make([]entities.UsageIdentity, 0)
+	for start := 0; start < len(authIndexes); start += redisUsageIdentityTypeLookupBatchSize {
+		end := start + redisUsageIdentityTypeLookupBatchSize
+		if end > len(authIndexes) {
+			end = len(authIndexes)
+		}
+		var batchRows []entities.UsageIdentity
+		// Redis inbox 单批最多可达 1000+ 条，SELECT IN 必须单独限批，避免 SQLite 变量上限导致整批反复 process_failed。
+		if err := db.WithContext(ctx).
+			Select("identity, type, is_deleted").
+			Where("auth_type = ? AND identity IN ? AND is_deleted = ?", entities.UsageIdentityAuthTypeAIProvider, authIndexes[start:end], isDeleted).
+			Find(&batchRows).Error; err != nil {
+			return nil, err
+		}
+		rows = append(rows, batchRows...)
+	}
+	return rows, nil
+}
+
+func addRedisUsageIdentityTypes(byAuthIndex map[string]string, rows []entities.UsageIdentity) {
+	for _, row := range rows {
+		identity := strings.TrimSpace(row.Identity)
+		usageType := strings.TrimSpace(row.Type)
+		if identity != "" && usageType != "" {
+			byAuthIndex[identity] = usageType
+		}
+	}
+}
+
+func redisUsageAPIKeyAuthIndexes(events []entities.UsageEvent) []string {
+	seen := make(map[string]struct{}, len(events))
+	authIndexes := make([]string, 0, len(events))
+	for _, event := range events {
+		if normalizeRedisAuthType(event.AuthType) != "apikey" {
+			continue
+		}
+		authIndex := strings.TrimSpace(event.AuthIndex)
+		if authIndex == "" {
+			continue
+		}
+		if _, ok := seen[authIndex]; ok {
+			continue
+		}
+		seen[authIndex] = struct{}{}
+		authIndexes = append(authIndexes, authIndex)
+	}
+	return authIndexes
+}
+
+func missingRedisUsageAuthIndexes(authIndexes []string, byAuthIndex map[string]string) []string {
+	missing := make([]string, 0)
+	for _, authIndex := range authIndexes {
+		if _, ok := byAuthIndex[authIndex]; ok {
+			continue
+		}
+		missing = append(missing, authIndex)
+	}
+	return missing
+}
+
+func resolveUsageEventType(event entities.UsageEvent, resolver usageEventTypeResolver) string {
+	switch normalizeRedisAuthType(event.AuthType) {
+	case "oauth":
+		return strings.TrimSpace(event.Provider)
+	case "apikey":
+		return strings.TrimSpace(resolver.byAuthIndex[strings.TrimSpace(event.AuthIndex)])
+	default:
+		return "openai"
+	}
+}
+
 // aggregateUsageEventStats 串行追平 usage_events 派生统计；空 inbox 时也调用它补偿上次失败的聚合。
 func (s *SyncService) aggregateUsageEventStats(ctx context.Context, now time.Time) error {
 	if err := repository.AggregateUsageIdentityStats(ctx, s.db, now); err != nil {
@@ -371,15 +500,7 @@ func (s *SyncService) validate(syncMetadata bool) error {
 
 // insertRedisInboxMessages 在解码前先把 Redis 原始消息落库，降低 LPOP 后本地处理失败导致的数据丢失风险。
 func insertRedisInboxMessages(db *gorm.DB, queueKey string, messages []string, poppedAt time.Time) ([]entities.RedisUsageInbox, error) {
-	inputs := make([]dto.RedisInboxInsert, 0, len(messages))
-	for _, message := range messages {
-		inputs = append(inputs, dto.RedisInboxInsert{
-			QueueKey:   queueKey,
-			RawMessage: message,
-			PoppedAt:   poppedAt,
-		})
-	}
-	return repository.InsertRedisUsageInboxMessages(db, inputs)
+	return repository.InsertRedisUsageInboxRawMessages(db, queueKey, messages, poppedAt)
 }
 
 // markRedisInboxRowsProcessFailed 记录可重试处理失败；达到仓储阈值后会转为 discarded 并打警告日志。
@@ -450,7 +571,7 @@ func syncAuthFiles(ctx context.Context, db *gorm.DB, result *response.AuthFilesR
 	return nil
 }
 
-// syncManagementAPIKeys 同步 CPA 管理 API key 清单；原值只在本地保存，前端查询时再脱敏。
+// syncManagementAPIKeys 同步 CPA 管理 API key 清单；原值只在本地保存，对外查询时再脱敏。
 func syncManagementAPIKeys(db *gorm.DB, result *response.ManagementAPIKeysResult, fetchErr error, now time.Time) error {
 	if fetchErr != nil {
 		return fmt.Errorf("fetch management api keys: %w", fetchErr)
@@ -492,6 +613,10 @@ func baseAuthFileUsageIdentity(file authfiles.AuthFile) entities.UsageIdentity {
 		Identity:     file.AuthIndex,
 		Type:         file.Type,
 		Provider:     file.Provider,
+		Prefix:       file.Prefix,
+		Priority:     file.Priority,
+		Disabled:     file.Disabled,
+		Note:         file.Note,
 	}
 }
 
@@ -585,6 +710,9 @@ func providerMetadataUsageIdentities(inputs []servicedto.ProviderMetadataInput) 
 			LookupKey:    input.LookupKey,
 			Prefix:       input.Prefix,
 			BaseURL:      input.BaseURL,
+			Priority:     input.Priority,
+			Disabled:     input.Disabled,
+			Note:         input.Note,
 		})
 	}
 	return identities
@@ -595,7 +723,7 @@ func flattenProviderMetadata(cfg providerconfig.ProviderMetadataConfig) []servic
 	items := make([]servicedto.ProviderMetadataInput, 0)
 	seen := make(map[string]struct{})
 	// Provider metadata 只生成 auth-index 身份；prefix 作为同一身份的附加字段保存，不再生成独立行。
-	appendItem := func(lookupKey, prefix, providerType, displayName, authIndex, baseURL string) {
+	appendItem := func(lookupKey, prefix, providerType, displayName, authIndex, baseURL string, priority *int, disabled *bool, note *string) {
 		lookupKey = strings.TrimSpace(lookupKey)
 		prefix = strings.TrimSpace(prefix)
 		providerType = strings.TrimSpace(providerType)
@@ -616,12 +744,15 @@ func flattenProviderMetadata(cfg providerconfig.ProviderMetadataConfig) []servic
 			DisplayName:  displayName,
 			AuthIndex:    authIndex,
 			BaseURL:      baseURL,
+			Priority:     priority,
+			Disabled:     disabled,
+			Note:         note,
 		})
 	}
 	appendProviderEntries := func(providerType string, configs []providerconfig.ProviderKeyConfig) {
 		for _, cfg := range configs {
 			displayName := firstNonEmpty(cfg.Name, providerType)
-			appendItem(cfg.APIKey, cfg.Prefix, providerType, displayName, cfg.AuthIndex, cfg.BaseURL)
+			appendItem(cfg.APIKey, cfg.Prefix, providerType, displayName, cfg.AuthIndex, cfg.BaseURL, cfg.Priority, cfg.Disabled, cfg.Note)
 		}
 	}
 
@@ -634,7 +765,7 @@ func flattenProviderMetadata(cfg providerconfig.ProviderMetadataConfig) []servic
 	for _, provider := range cfg.OpenAICompatibility {
 		displayName := firstNonEmpty(provider.Name, "openai")
 		for _, entry := range provider.APIKeyEntries {
-			appendItem(entry.APIKey, provider.Prefix, "openai", displayName, entry.AuthIndex, provider.BaseURL)
+			appendItem(entry.APIKey, provider.Prefix, "openai", displayName, entry.AuthIndex, provider.BaseURL, provider.Priority, provider.Disabled, provider.Note)
 		}
 	}
 

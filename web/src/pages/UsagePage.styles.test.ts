@@ -1,20 +1,23 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
-const usagePageStyles = readFileSync(new URL('./UsagePage.module.scss', import.meta.url), 'utf8')
-const usagePageSource = readFileSync(new URL('./UsagePage.tsx', import.meta.url), 'utf8')
-const requestEventsSource = readFileSync(new URL('../components/usage/RequestEventsDetailsCard.tsx', import.meta.url), 'utf8')
-const priceSettingsSource = readFileSync(new URL('../components/usage/PriceSettingsCard.tsx', import.meta.url), 'utf8')
-const chartLineSelectorSource = readFileSync(new URL('../components/usage/ChartLineSelector.tsx', import.meta.url), 'utf8')
-const selectSource = readFileSync(new URL('../components/ui/Select.tsx', import.meta.url), 'utf8')
-const apiIndexSource = readFileSync(new URL('../components/usage/index.ts', import.meta.url), 'utf8')
-const apiClientSource = readFileSync(new URL('../lib/api.ts', import.meta.url), 'utf8')
-const i18nSource = readFileSync(new URL('../i18n/index.ts', import.meta.url), 'utf8')
-const analysisPanelSource = readFileSync(new URL('../components/usage/analysis/AnalysisPanel.tsx', import.meta.url), 'utf8')
-const analysisPanelStyles = readFileSync(new URL('../components/usage/analysis/AnalysisPanel.module.scss', import.meta.url), 'utf8')
-const usageChartSource = readFileSync(new URL('../components/usage/UsageChart.tsx', import.meta.url), 'utf8')
-const tokenBreakdownChartSource = readFileSync(new URL('../components/usage/TokenBreakdownChart.tsx', import.meta.url), 'utf8')
-const costTrendChartSource = readFileSync(new URL('../components/usage/CostTrendChart.tsx', import.meta.url), 'utf8')
+const readSource = (url: URL) => readFileSync(url, 'utf8').replace(/\r\n/g, '\n')
+
+const globalStyles = readSource(new URL('../styles/global.scss', import.meta.url))
+const usagePageStyles = readSource(new URL('./UsagePage.module.scss', import.meta.url))
+const usagePageSource = readSource(new URL('./UsagePage.tsx', import.meta.url))
+const requestEventsSource = readSource(new URL('../components/usage/RequestEventsDetailsCard.tsx', import.meta.url))
+const priceSettingsSource = readSource(new URL('../components/usage/PriceSettingsCard.tsx', import.meta.url))
+const chartLineSelectorSource = readSource(new URL('../components/usage/ChartLineSelector.tsx', import.meta.url))
+const selectSource = readSource(new URL('../components/ui/Select.tsx', import.meta.url))
+const apiIndexSource = readSource(new URL('../components/usage/index.ts', import.meta.url))
+const apiClientSource = readSource(new URL('../lib/api.ts', import.meta.url))
+const i18nSource = readSource(new URL('../i18n/index.ts', import.meta.url))
+const analysisPanelSource = readSource(new URL('../components/usage/analysis/AnalysisPanel.tsx', import.meta.url))
+const analysisPanelStyles = readSource(new URL('../components/usage/analysis/AnalysisPanel.module.scss', import.meta.url))
+const usageChartSource = readSource(new URL('../components/usage/UsageChart.tsx', import.meta.url))
+const tokenBreakdownChartSource = readSource(new URL('../components/usage/TokenBreakdownChart.tsx', import.meta.url))
+const costTrendChartSource = readSource(new URL('../components/usage/CostTrendChart.tsx', import.meta.url))
 
 describe('UsagePage toolbar styles', () => {
   it('keeps visible range controls content-sized in narrow layouts', () => {
@@ -52,7 +55,14 @@ describe('UsagePage toolbar styles', () => {
     expect(i18nSource).not.toContain("tab_analysis: 'API & Models'")
     expect(i18nSource).not.toContain("tab_analysis: 'API 与模型'")
     expect(i18nSource).not.toContain("tab_analysis: 'API 與模型'")
-    expect(usagePageSource).toContain("const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'events', 'credentials', 'settings'] as const")
+    expect(usagePageSource).toContain("const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'events', 'auth-files', 'ai-provider', 'settings'] as const")
+  })
+
+  it('keeps Sign out as the rightmost header action after Check Updates', () => {
+    expect(usagePageSource).toContain("import { ApiError, fetchAnalysis, fetchCpaApiKeyOptions, fetchCpaApiKeys, fetchStatus, fetchUpdateCheck, fetchUsageEventModelFilterOptions, fetchUsageEventSourceFilterOptions, fetchUsageEvents, logout, markStatusActive, updateCpaApiKeyAlias } from '@/lib/api';")
+    expect(usagePageSource.indexOf("t('usage_stats.check_updates')")).toBeLessThan(usagePageSource.indexOf("t('common.logout')"))
+    expect(usagePageStyles).toContain('.signOutSwitcher')
+    expect(usagePageStyles).toContain('.signOutPill')
   })
 
   it('keeps mobile tab labels on one line without changing desktop tab sizing', () => {
@@ -65,11 +75,61 @@ describe('UsagePage toolbar styles', () => {
     expect(desktopTabPillBlock).not.toContain('white-space: nowrap;')
   })
 
-  it('lets mobile API Key Settings content scroll inside the card instead of being clipped', () => {
-    expect(usagePageStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.apiKeySettingsCard:global\(\.card\)\s*\{[\s\S]*?height:\s*auto;/)
-    expect(usagePageStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.apiKeySettingsBody\s*\{[\s\S]*?height:\s*480px;/)
-    expect(usagePageStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.apiKeySettingsBody\s*\{[\s\S]*?overflow-y:\s*auto;/)
-    expect(usagePageStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.apiKeySettingsList\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/)
+  it('lets API Key Settings content scroll inside the card instead of being clipped', () => {
+    expect(usagePageStyles).toMatch(/\.apiKeySettingsCard:global\(\.card\)\s*\{[\s\S]*?min-height:\s*auto;/)
+    expect(usagePageStyles).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?flex:\s*0 0 auto;/)
+    expect(usagePageStyles).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?height:\s*var\(--settings-list-scroll-height\);/)
+    expect(usagePageStyles).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?min-height:\s*0;/)
+    expect(usagePageStyles).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?overflow-y:\s*auto;/)
+    expect(usagePageStyles).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?padding-right:\s*4px;/)
+    const apiKeySettingsMobileBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('@include mobile {\n  .apiKeySettingsCard:global(.card)'),
+      usagePageStyles.indexOf('.pricesList')
+    )
+
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeySettingsCard:global\(\.card\)\s*\{[\s\S]*?height:\s*auto;/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?height:\s*var\(--settings-list-scroll-height\);/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeySettingsList\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeySettingsItem\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeySettingsItem\s*\{[^}]*align-items:\s*stretch;/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeyAliasField\s*\{[\s\S]*?width:\s*100%;/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeyAliasField\s*\{[\s\S]*?:global\(\.form-group\)\s*\{[\s\S]*?width:\s*100%;/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeyAliasField\s*\{[\s\S]*?:global\(\.form-group\)\s*\{[\s\S]*?min-width:\s*0;/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeyAliasField\s*\{[\s\S]*?:global\(\.form-group\)\s*\{[\s\S]*?margin-bottom:\s*0;/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeyAliasInput\s*\{[\s\S]*?max-width:\s*100%;/)
+  })
+
+  it('keeps Model Pricing Settings list viewport aligned with API Key Settings without shrinking it behind the form', () => {
+    const settingsSectionsBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('.settingsSections {'),
+      usagePageStyles.indexOf('// Pricing Section')
+    )
+    const pricingBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('.pricingFixedCard {'),
+      usagePageStyles.indexOf('.priceForm')
+    )
+    const apiKeyBodyBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('.apiKeySettingsBody {'),
+      usagePageStyles.indexOf('.apiKeySettingsList')
+    )
+    const apiKeySettingsMobileBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('@include mobile {\n  .apiKeySettingsCard:global(.card)'),
+      usagePageStyles.indexOf('.pricesList')
+    )
+    const pricingGridBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('.pricesGrid {'),
+      usagePageStyles.indexOf('.priceItem')
+    )
+
+    expect(settingsSectionsBlock).toMatch(/--settings-list-scroll-height:\s*480px;/)
+    expect(pricingBlock).toMatch(/\.pricingFixedCard\s*\{[\s\S]*?height:\s*auto;/)
+    expect(pricingBlock).not.toMatch(/\.pricingSection\s*\{[\s\S]*?height:\s*480px;/)
+    expect(apiKeyBodyBlock).toMatch(/height:\s*var\(--settings-list-scroll-height\);/)
+    expect(apiKeySettingsMobileBlock).toMatch(/\.apiKeySettingsBody\s*\{[\s\S]*?height:\s*var\(--settings-list-scroll-height\);/)
+    expect(pricingGridBlock).toMatch(/height:\s*var\(--settings-list-scroll-height\);/)
+    expect(pricingGridBlock).toMatch(/\.pricesGrid\s*\{[\s\S]*?overflow-y:\s*auto;/)
+    expect(pricingGridBlock).toMatch(/\.pricesGrid\s*\{[\s\S]*?overflow-x:\s*hidden;/)
+    expect(pricingGridBlock).not.toMatch(/@include mobile\s*\{[\s\S]*?overflow:\s*visible;/)
   })
 
   it('keeps the Analysis chart presentation aligned with the reference design', () => {
@@ -145,7 +205,7 @@ describe('UsagePage toolbar styles', () => {
     expect(analysisPanelSource).not.toContain("'#b28b67'")
     expect(analysisPanelSource).not.toContain("'#7f756b'")
     expect(analysisPanelSource).toContain("import { Bar, Doughnut } from 'react-chartjs-2'")
-    expect(analysisPanelSource).toContain("import type { ChartData, ChartOptions, Plugin } from 'chart.js'")
+    expect(analysisPanelSource).toContain("import type { Chart, ChartData, ChartOptions, Plugin, TooltipModel } from 'chart.js'")
     expect(analysisPanelSource).not.toContain("from 'recharts'")
     expect(analysisPanelSource).toContain('buildAnalysisTokenChartOptions')
     expect(analysisPanelSource).toContain('buildTokenLegendItems')
@@ -163,6 +223,12 @@ describe('UsagePage toolbar styles', () => {
     expect(analysisPanelSource).toMatch(/reasoning:\s*\{ base:\s*'#8b5cf6',\s*light:\s*'#d8b4fe' \}/)
     expect(analysisPanelSource).toContain('backgroundColor: (context) => toGradientFill(context, tokenColors.input)')
     expect(analysisPanelSource).toContain('backgroundColor: (context) => toGradientFill(context, CHART_COLORS[context.dataIndex % CHART_COLORS.length])')
+    expect(analysisPanelSource).toContain('const COMPOSITION_TOOLTIP_MAX_WIDTH = 400')
+    expect(analysisPanelSource).toContain('function createCompositionTooltipHandler(chartTheme: ChartTheme)')
+    expect(analysisPanelSource).toContain('external: createCompositionTooltipHandler(chartTheme)')
+    expect(analysisPanelSource).toContain('Math.min(COMPOSITION_TOOLTIP_MAX_WIDTH, viewportWidth - COMPOSITION_TOOLTIP_VIEWPORT_PADDING * 2)')
+    expect(analysisPanelSource).toContain('Math.max(COMPOSITION_TOOLTIP_VIEWPORT_PADDING, Math.min(rawLeft, viewportWidth - tooltipWidth - COMPOSITION_TOOLTIP_VIEWPORT_PADDING))')
+    expect(analysisPanelSource).toContain('overflowWrap = \'anywhere\'')
     expect(analysisPanelSource).toContain('<Bar data={chartData} options={chartOptions} plugins={[drawRequestsLineOnTopPlugin]} />')
     expect(analysisPanelSource).toContain('const drawRequestsLineOnTopPlugin')
     expect(analysisPanelSource).toContain('meta.type === \'line\'')
@@ -196,8 +262,34 @@ describe('UsagePage toolbar styles', () => {
     expect(analysisPanelSource).toContain('data-full-name={model}')
     expect(analysisPanelSource).toContain('data-full-name={apiKey}')
     expect(analysisPanelSource).toContain('background: getHeatmapCellGradient(intensity)')
+    expect(analysisPanelSource).toContain('color: getHeatmapCellTextColor(intensity)')
+    expect(analysisPanelSource).toContain('const getHeatmapVisualIntensity = (value: number, maxValue: number)')
+    expect(analysisPanelSource).toContain('const rawIntensity = value / maxValue')
+    expect(analysisPanelSource).toContain('return 0.05 + 0.95 * Math.pow(rawIntensity, 0.65)')
+    expect(analysisPanelSource).not.toContain('Math.log1p(value) / Math.log1p(maxValue)')
+    expect(analysisPanelSource).toContain('const maxHeatmapTokens = useMemo(() => Math.max(0, ...cells.map((cell) => toNumber(cell.total_tokens))), [cells])')
+    expect(analysisPanelSource).toContain('const intensity = getHeatmapVisualIntensity(heatmapTokens, maxHeatmapTokens)')
+    expect(analysisPanelSource).not.toContain('toNumber(cell?.intensity)')
+    expect(analysisPanelSource).toContain('const getHeatmapCellTextColor = (intensity: number)')
+    expect(analysisPanelSource).toContain('interpolateColor([107, 71, 35], [48, 24, 16]')
+    expect(analysisPanelSource).toContain('const opacity = 0.58 + clampedIntensity * 0.28')
+    expect(analysisPanelSource).toContain('const heatmapTokens = toNumber(cell?.total_tokens)')
+    expect(analysisPanelSource).toContain('const heatmapRequests = toNumber(cell?.requests)')
+    expect(analysisPanelSource).toContain("t('usage_stats.analysis_heatmap_tokens_prefix')")
+    expect(analysisPanelSource).toContain("t('usage_stats.analysis_heatmap_requests_prefix')")
+    expect(analysisPanelSource).not.toContain('<span className={styles.heatmapCellTokenValue}>T: {formatCompactNumber(heatmapTokens)}</span>')
+    expect(analysisPanelSource).not.toContain('<span className={styles.heatmapCellRequestValue}>R: {formatCompactNumber(heatmapRequests)}</span>')
+    expect(analysisPanelSource).not.toContain('apiKey,\n                            model,')
     expect(analysisPanelSource).toContain('interpolateColor([255, 250, 238], [226, 181, 98]')
     expect(analysisPanelSource).toContain('interpolateColor([214, 162, 76], [198, 87, 70]')
+    expect(analysisPanelStyles).toMatch(/\.heatmapCell\s*\{[\s\S]*?display:\s*flex;/)
+    expect(analysisPanelStyles).toMatch(/\.heatmapCell\s*\{[\s\S]*?flex-direction:\s*column;/)
+    expect(analysisPanelStyles).toMatch(/\.heatmapCell\s*\{[\s\S]*?align-items:\s*center;/)
+    expect(analysisPanelStyles).toMatch(/\.heatmapCellTokenValue\s*\{[\s\S]*?font-size:\s*9px;/)
+    expect(analysisPanelStyles).toMatch(/\.heatmapCellRequestValue\s*\{[\s\S]*?font-size:\s*8px;/)
+    expect(analysisPanelStyles).toMatch(/\.heatmapCellRequestValue\s*\{[\s\S]*?opacity:\s*0\.62;/)
+    expect(analysisPanelStyles).not.toMatch(/\.heatmapCell\s*\{[\s\S]*?color:\s*rgba\(79, 45, 22, 0\.72\);/)
+    expect(analysisPanelStyles).not.toContain('color-mix(in srgb, var(--text-primary)')
     expect(analysisPanelStyles).toMatch(/\.analysisChartSurface\s*\{[\s\S]*?background:\s*var\(--bg-secondary\);/)
     expect(analysisPanelStyles).toMatch(/\.analysisChartSurface\s*\{[\s\S]*?border:\s*1px solid var\(--border-color\);/)
     expect(analysisPanelStyles).toMatch(/\.analysisChartLegend\s*\{[\s\S]*?display:\s*flex;/)
@@ -252,9 +344,45 @@ describe('UsagePage toolbar styles', () => {
     expect(usagePageStyles).toMatch(/\.customRangeInput\s*\{[\s\S]*?-webkit-user-select:\s*none;/)
     expect(usagePageSource).not.toContain('readOnly')
     expect(usagePageSource).not.toContain('onPointerDown={handleCustomDateInputPointerDown}')
+    expect(usagePageSource).toContain('className={styles.customRangeInputShell}')
+    expect(usagePageSource).toContain('className={styles.customRangeInputDisplay}')
     expect(usagePageSource).toContain('onClick={handleCustomDateInputActivate}')
     expect(usagePageSource).toContain('onFocus={handleCustomDateInputActivate}')
     expect(usagePageSource).toContain('onKeyDown={handleCustomDateInputKeyDown}')
+  })
+
+  it('keeps mobile custom date fields inside the toolbar before the refresh action', () => {
+    const narrowToolbarStart = usagePageStyles.indexOf('@media (max-width: #{$breakpoint-tablet})')
+    const mobileToolbarStart = usagePageStyles.indexOf('@include mobile {\n  .tabPill', narrowToolbarStart)
+    const narrowToolbarBlock = usagePageStyles.slice(
+      narrowToolbarStart,
+      mobileToolbarStart
+    )
+    const mobileToolbarBlock = usagePageStyles.slice(
+      mobileToolbarStart,
+      usagePageStyles.indexOf('@media (prefers-reduced-motion: reduce)')
+    )
+
+    expect(narrowToolbarBlock).toMatch(/\.usageFilterBar\s*\{[\s\S]*?max-height:\s*none;/)
+    expect(narrowToolbarBlock).toMatch(/\.usageFilterBar\s*\{[\s\S]*?overflow:\s*visible;/)
+    expect(narrowToolbarBlock).toMatch(/\.timeRangeGroup\s*\{[\s\S]*?width:\s*100%;/)
+    expect(narrowToolbarBlock).toMatch(/\.customRangeFieldGroup\s*\{[\s\S]*?width:\s*100%;/)
+    expect(narrowToolbarBlock).toMatch(/\.customRangeFieldGroupOpen\s*\{[\s\S]*?max-height:\s*180px;/)
+    expect(mobileToolbarBlock).toMatch(/\.usageFilterBar\s*\{[\s\S]*?display:\s*grid;/)
+    expect(mobileToolbarBlock).toMatch(/\.usageFilterBar\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/)
+    expect(mobileToolbarBlock).toMatch(/\.rangeFilterField\s*\{[\s\S]*?grid-template-columns:\s*auto minmax\(0, 1fr\);/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeFieldGroup\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeField\s*\{[\s\S]*?grid-template-columns:\s*auto minmax\(0, 1fr\);/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeField\s*\{[\s\S]*?min-width:\s*0;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeField\s*\{[\s\S]*?max-width:\s*100%;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInputShell\s*\{[\s\S]*?position:\s*relative;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInputShell\s*\{[\s\S]*?overflow:\s*hidden;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInputDisplay\s*\{[\s\S]*?display:\s*flex;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInput\s*\{[\s\S]*?position:\s*absolute;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInput\s*\{[\s\S]*?min-width:\s*0;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInput\s*\{[\s\S]*?max-width:\s*100%;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInput\s*\{[\s\S]*?display:\s*block;/)
+    expect(mobileToolbarBlock).toMatch(/\.customRangeInput\s*\{[\s\S]*?opacity:\s*0;/)
   })
 
   it('keeps Overview chart period controls hidden because period selection is automatic', () => {
@@ -283,22 +411,45 @@ describe('UsagePage toolbar styles', () => {
   })
 
   it('aligns Request Event Log pagination with credential pagination height', () => {
-    expect(usagePageStyles).toMatch(/\.requestEventsCard:global\(\.card\)\s*\{[\s\S]*?padding-bottom:\s*0;/)
+    expect(usagePageStyles).toMatch(/\.requestEventsCard:global\(\.card\)\s*\{[\s\S]*?padding:\s*0;/)
     expect(requestEventsSource).toContain('className={styles.requestEventsCard}')
     expect(usagePageStyles).toMatch(/\.requestEventsPaginationFooter\s*\{[\s\S]*?--usage-pagination-bar-height:\s*51px;/)
     expect(usagePageStyles).toMatch(/\.requestEventsPaginationFooter\s*\{[\s\S]*?height:\s*var\(--usage-pagination-bar-height\);/)
     expect(usagePageStyles).toMatch(/\.requestEventsPaginationFooter\s*\{[\s\S]*?box-sizing:\s*border-box;/)
     expect(usagePageStyles).toMatch(/\.requestEventsPaginationFooter\s*\{[\s\S]*?align-items:\s*center;/)
-    expect(usagePageStyles).toMatch(/\.requestEventsPaginationFooter\s*\{[\s\S]*?padding:\s*0 #\{\$spacing-lg\};/)
+    expect(usagePageStyles).toMatch(/\.requestEventsPaginationFooter\s*\{[\s\S]*?padding:\s*0 22px;/)
   })
 
   it('keeps Request Event Log headers visible while the table scrolls', () => {
-    expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?height:\s*clamp\(400px,\s*60vh,\s*600px\);/)
+    expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?height:\s*clamp\(520px,\s*68vh,\s*760px\);/)
     expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?overflow:\s*auto;/)
     expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?thead\s+th\s*\{[\s\S]*?position:\s*sticky;/)
     expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?thead\s+th\s*\{[\s\S]*?top:\s*0;/)
     expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?thead\s+th\s*\{[\s\S]*?z-index:\s*2;/)
     expect(usagePageStyles).toMatch(/\.requestEventsTableWrapper\s*\{[\s\S]*?\.table\s*\{[\s\S]*?border-collapse:\s*separate;/)
+  })
+
+  it('themes the WebKit scrollbar corner so intersecting scrollbars do not show a white square', () => {
+    expect(globalStyles).toMatch(/::-webkit-scrollbar-corner\s*\{[\s\S]*?background:\s*var\(--bg-secondary\);/)
+  })
+
+  it('renders Request Event Log with a single outer frame instead of a nested table card', () => {
+    const cardBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('.requestEventsCard:global(.card) {'),
+      usagePageStyles.indexOf('.requestEventsTitleRow')
+    )
+    const tableWrapperBlock = usagePageStyles.slice(
+      usagePageStyles.indexOf('.requestEventsTableWrapper {'),
+      usagePageStyles.indexOf('.requestEventsTimestamp')
+    )
+
+    expect(cardBlock).toMatch(/padding:\s*0;/)
+    expect(cardBlock).toMatch(/overflow:\s*hidden;/)
+    expect(cardBlock).toMatch(/:global\(\.card-header\)\s*\{[\s\S]*?margin-bottom:\s*0;/)
+    expect(cardBlock).toMatch(/:global\(\.card-header\)\s*\{[\s\S]*?border-bottom:\s*1px solid var\(--border-color\);/)
+    expect(tableWrapperBlock).toMatch(/border:\s*0;/)
+    expect(tableWrapperBlock).toMatch(/border-radius:\s*0;/)
+    expect(tableWrapperBlock).not.toMatch(/border:\s*1px solid/)
   })
 
   it('keeps the Request Event Log timestamp column compact', () => {
@@ -311,6 +462,11 @@ describe('UsagePage toolbar styles', () => {
     expect(usagePageStyles).toMatch(/\.requestEventsReasoningHeader\s*\{[\s\S]*?white-space:\s*nowrap;/)
     expect(usagePageStyles).not.toMatch(/\.requestEventsReasoningHeader\s*\{[^}]*width:/)
     expect(requestEventsSource).toContain('<th className={styles.requestEventsReasoningHeader}>{t(\'usage_stats.reasoning_tokens\')}</th>')
+  })
+
+  it('keeps Request Event Log model and endpoint columns compact', () => {
+    expect(usagePageStyles).toMatch(/\.modelCell\s*\{[\s\S]*?min-width:\s*110px;/)
+    expect(usagePageStyles).toMatch(/\.requestEventsEndpointCell\s*\{[\s\S]*?min-width:\s*100px;/)
   })
 
   it('provides reusable pill controls for usage subpages', () => {

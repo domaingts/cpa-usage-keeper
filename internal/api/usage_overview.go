@@ -1,10 +1,11 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
-	"cpa-usage-keeper/internal/redact"
+	"cpa-usage-keeper/internal/auth"
 	repodto "cpa-usage-keeper/internal/repository/dto"
 	"cpa-usage-keeper/internal/service"
 	servicedto "cpa-usage-keeper/internal/service/dto"
@@ -25,15 +26,14 @@ type usageOverviewResponse struct {
 }
 
 type usageOverviewPayload struct {
-	TotalRequests  int64                               `json:"total_requests"`
-	SuccessCount   int64                               `json:"success_count"`
-	FailureCount   int64                               `json:"failure_count"`
-	TotalTokens    int64                               `json:"total_tokens"`
-	APIs           map[string]usageOverviewAPISnapshot `json:"apis"`
-	RequestsByDay  map[string]int64                    `json:"requests_by_day"`
-	RequestsByHour map[string]int64                    `json:"requests_by_hour"`
-	TokensByDay    map[string]int64                    `json:"tokens_by_day"`
-	TokensByHour   map[string]int64                    `json:"tokens_by_hour"`
+	TotalRequests  int64            `json:"total_requests"`
+	SuccessCount   int64            `json:"success_count"`
+	FailureCount   int64            `json:"failure_count"`
+	TotalTokens    int64            `json:"total_tokens"`
+	RequestsByDay  map[string]int64 `json:"requests_by_day"`
+	RequestsByHour map[string]int64 `json:"requests_by_hour"`
+	TokensByDay    map[string]int64 `json:"tokens_by_day"`
+	TokensByHour   map[string]int64 `json:"tokens_by_hour"`
 }
 
 type usageOverviewSummary struct {
@@ -93,72 +93,114 @@ type usageOverviewServiceHealthBlock struct {
 	Rate      float64   `json:"rate"`
 }
 
-type usageOverviewAPISnapshot struct {
-	DisplayName   string                                `json:"display_name,omitempty"`
-	TotalRequests int64                                 `json:"total_requests"`
-	SuccessCount  int64                                 `json:"success_count"`
-	FailureCount  int64                                 `json:"failure_count"`
-	TotalTokens   int64                                 `json:"total_tokens"`
-	Models        map[string]usageOverviewModelSnapshot `json:"models"`
+var allowedKeyOverviewRanges = map[string]struct{}{
+	"4h": {}, "8h": {}, "12h": {}, "24h": {}, "today": {}, "yesterday": {}, "7d": {}, "30d": {},
 }
 
-type usageOverviewModelSnapshot struct {
-	TotalRequests int64 `json:"total_requests"`
-	SuccessCount  int64 `json:"success_count"`
-	FailureCount  int64 `json:"failure_count"`
-	TotalTokens   int64 `json:"total_tokens"`
+func registerKeyOverviewRoute(router gin.IRoutes, usageProvider service.UsageProvider, cpaAPIKeyProvider service.CPAAPIKeyProvider, authHandler *authHandler) {
+	router.GET("/key-overview", func(c *gin.Context) {
+		token, _ := c.Get("auth_token")
+		sessionValue, _ := c.Get("auth_session")
+		session, ok := sessionValue.(auth.Session)
+		if !ok || session.Role != auth.RoleAPIKeyViewer || session.CPAAPIKeyID <= 0 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+			return
+		}
+		if cpaAPIKeyProvider == nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+			return
+		}
+		if _, err := cpaAPIKeyProvider.FindActiveCPAAPIKeyByID(c.Request.Context(), session.CPAAPIKeyID); err != nil {
+			if authHandler != nil {
+				authHandler.deleteSession(fmt.Sprint(token))
+				clearSessionCookie(c, authHandler.config.BasePath)
+			}
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+			return
+		}
+		filter, err := parseKeyOverviewFilterQuery(c.Request, timeutil.NormalizeStorageTime(time.Now()))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if authHandler != nil && !authHandler.allowKeyOverviewRequest(fmt.Sprint(token)) {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
+			return
+		}
+		filter.APIKeyID = fmt.Sprintf("%d", session.CPAAPIKeyID)
+		writeUsageOverviewResponse(c, usageProvider, filter)
+	})
 }
 
 func registerUsageOverviewRoute(router gin.IRoutes, usageProvider service.UsageProvider) {
 	router.GET("/usage/overview", func(c *gin.Context) {
 		if usageProvider == nil {
-			c.JSON(http.StatusOK, usageOverviewResponse{
-				Usage:         buildUsageOverviewPayload(nil),
-				Summary:       usageOverviewSummary{},
-				Series:        emptyUsageOverviewSeries(),
-				HourlySeries:  emptyUsageOverviewSeries(),
-				DailySeries:   emptyUsageOverviewSeries(),
-				ServiceHealth: usageOverviewServiceHealth{BlockDetails: []usageOverviewServiceHealthBlock{}},
-				Timezone:      time.Local.String(),
-			})
+			writeUsageOverviewResponse(c, usageProvider, servicedto.UsageFilter{})
 			return
 		}
-
 		filter, err := parseUsageFilterQuery(c.Request, timeutil.NormalizeStorageTime(time.Now()))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+		writeUsageOverviewResponse(c, usageProvider, filter)
+	})
+}
 
-		overview, err := usageProvider.GetUsageOverview(c.Request.Context(), filter)
-		if err != nil {
-			writeInternalError(c, "get usage overview failed", err)
-			return
-		}
+func parseKeyOverviewFilterQuery(req *http.Request, anchor time.Time) (servicedto.UsageFilter, error) {
+	query := req.URL.Query()
+	if query.Get("start") != "" || query.Get("end") != "" {
+		return servicedto.UsageFilter{}, fmt.Errorf("custom ranges are not supported")
+	}
+	rangeValue := query.Get("range")
+	if _, ok := allowedKeyOverviewRanges[rangeValue]; !ok {
+		return servicedto.UsageFilter{}, fmt.Errorf("unsupported key overview range %q", rangeValue)
+	}
+	return parseUsageFilterQuery(req, anchor)
+}
 
-		var usage *repodto.StatisticsSnapshot
-		if overview != nil {
-			usage = overview.Usage
-		}
-		redactedUsage := redact.UsageSnapshot(usage)
+func writeUsageOverviewResponse(c *gin.Context, usageProvider service.UsageProvider, filter servicedto.UsageFilter) {
+	if usageProvider == nil {
 		c.JSON(http.StatusOK, usageOverviewResponse{
-			Usage:         buildUsageOverviewPayload(redactedUsage),
-			Summary:       buildUsageOverviewSummary(overview),
-			Series:        buildUsageOverviewSeries(overview),
-			HourlySeries:  buildUsageOverviewHourlySeries(overview),
-			DailySeries:   buildUsageOverviewDailySeries(overview),
-			ServiceHealth: buildUsageOverviewServiceHealth(overview),
+			Usage:         buildUsageOverviewPayload(nil),
+			Summary:       usageOverviewSummary{},
+			Series:        emptyUsageOverviewSeries(),
+			HourlySeries:  emptyUsageOverviewSeries(),
+			DailySeries:   emptyUsageOverviewSeries(),
+			ServiceHealth: usageOverviewServiceHealth{BlockDetails: []usageOverviewServiceHealthBlock{}},
 			Timezone:      time.Local.String(),
 			RangeStart:    filter.StartTime,
 			RangeEnd:      filter.EndTime,
 		})
+		return
+	}
+
+	overview, err := usageProvider.GetUsageOverview(c.Request.Context(), filter)
+	if err != nil {
+		writeInternalError(c, "get usage overview failed", err)
+		return
+	}
+
+	var usage *repodto.StatisticsSnapshot
+	if overview != nil {
+		usage = overview.Usage
+	}
+	c.JSON(http.StatusOK, usageOverviewResponse{
+		Usage:         buildUsageOverviewPayload(usage),
+		Summary:       buildUsageOverviewSummary(overview),
+		Series:        buildUsageOverviewSeries(overview),
+		HourlySeries:  buildUsageOverviewHourlySeries(overview),
+		DailySeries:   buildUsageOverviewDailySeries(overview),
+		ServiceHealth: buildUsageOverviewServiceHealth(overview),
+		Timezone:      time.Local.String(),
+		RangeStart:    filter.StartTime,
+		RangeEnd:      filter.EndTime,
 	})
 }
 
 func buildUsageOverviewPayload(snapshot *repodto.StatisticsSnapshot) usageOverviewPayload {
 	if snapshot == nil {
 		return usageOverviewPayload{
-			APIs:           map[string]usageOverviewAPISnapshot{},
 			RequestsByDay:  map[string]int64{},
 			RequestsByHour: map[string]int64{},
 			TokensByDay:    map[string]int64{},
@@ -175,27 +217,6 @@ func buildUsageOverviewPayload(snapshot *repodto.StatisticsSnapshot) usageOvervi
 		RequestsByHour: cloneInt64Map(snapshot.RequestsByHour),
 		TokensByDay:    cloneInt64Map(snapshot.TokensByDay),
 		TokensByHour:   cloneInt64Map(snapshot.TokensByHour),
-		APIs:           map[string]usageOverviewAPISnapshot{},
-	}
-
-	for apiName, apiSnapshot := range snapshot.APIs {
-		payloadAPI := usageOverviewAPISnapshot{
-			DisplayName:   apiSnapshot.DisplayName,
-			TotalRequests: apiSnapshot.TotalRequests,
-			SuccessCount:  apiSnapshot.SuccessCount,
-			FailureCount:  apiSnapshot.FailureCount,
-			TotalTokens:   apiSnapshot.TotalTokens,
-			Models:        map[string]usageOverviewModelSnapshot{},
-		}
-		for modelName, modelSnapshot := range apiSnapshot.Models {
-			payloadAPI.Models[modelName] = usageOverviewModelSnapshot{
-				TotalRequests: modelSnapshot.TotalRequests,
-				SuccessCount:  modelSnapshot.SuccessCount,
-				FailureCount:  modelSnapshot.FailureCount,
-				TotalTokens:   modelSnapshot.TotalTokens,
-			}
-		}
-		payload.APIs[apiName] = payloadAPI
 	}
 
 	return payload

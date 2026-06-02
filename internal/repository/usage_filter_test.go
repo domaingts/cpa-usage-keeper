@@ -2,7 +2,6 @@ package repository
 
 import (
 	"context"
-	"cpa-usage-keeper/internal/repository/dto"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -12,6 +11,8 @@ import (
 
 	"cpa-usage-keeper/internal/config"
 	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/helper"
+	"cpa-usage-keeper/internal/repository/dto"
 	"cpa-usage-keeper/internal/timeutil"
 	"gorm.io/gorm"
 )
@@ -33,53 +34,11 @@ func buildUsageOverviewFromEventsForTest(events []entities.UsageEvent, filter dt
 	latestHourlyStart := latestHourlySeriesStart(filter)
 	overview := newUsageOverviewRecord(filter, windowMinutes)
 	for _, event := range events {
-		applyUsageEventToSnapshot(overview.Usage, event, false)
+		applyUsageEventToOverviewSnapshot(overview.Usage, event)
 		applyUsageEventToOverview(overview, event, bucketByDay, latestHourlyStart, pricingByModel)
 	}
-	finalizeUsageOverview(overview, false)
+	finalizeUsageOverview(overview)
 	return overview
-}
-
-func TestBuildUsageSnapshotWithFilterAppliesTimeBounds(t *testing.T) {
-	withRepositoryTestLocation(t, "Asia/Shanghai")
-
-	db, err := OpenDatabase(config.Config{SQLitePath: filepath.Join(t.TempDir(), "usage-filter.db")})
-	if err != nil {
-		t.Fatalf("OpenDatabase returned error: %v", err)
-	}
-	closeTestDatabase(t, db)
-
-	events := []entities.UsageEvent{
-		{EventKey: "event-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC), Source: "source-a", AuthIndex: "1", TotalTokens: 10},
-		{EventKey: "event-2", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC), Source: "source-b", AuthIndex: "2", TotalTokens: 20},
-		{EventKey: "event-3", APIGroupKey: "provider-b", Model: "claude-opus", Timestamp: time.Date(2026, 4, 17, 10, 0, 0, 0, time.UTC), Source: "source-c", AuthIndex: "3", TotalTokens: 30},
-	}
-	if _, _, err := InsertUsageEvents(db, events); err != nil {
-		t.Fatalf("InsertUsageEvents returned error: %v", err)
-	}
-
-	start := time.Date(2026, 4, 16, 9, 30, 0, 0, time.UTC)
-	end := time.Date(2026, 4, 16, 23, 59, 59, 0, time.UTC)
-	snapshot, err := BuildUsageSnapshotWithFilter(db, dto.UsageQueryFilter{StartTime: &start, EndTime: &end})
-	if err != nil {
-		t.Fatalf("BuildUsageSnapshotWithFilter returned error: %v", err)
-	}
-
-	if snapshot.TotalRequests != 1 {
-		t.Fatalf("expected one in-range request, got %+v", snapshot)
-	}
-	if snapshot.TotalTokens != 20 {
-		t.Fatalf("expected in-range tokens only, got %+v", snapshot)
-	}
-	if len(snapshot.APIs) != 1 {
-		t.Fatalf("expected one API in filtered snapshot, got %+v", snapshot.APIs)
-	}
-	if snapshot.RequestsByHour["2026-04-16T18:00:00+08:00"] != 1 {
-		t.Fatalf("expected only 18:00 project-time bucket to remain, got %+v", snapshot.RequestsByHour)
-	}
-	if _, ok := snapshot.RequestsByHour["2026-04-16T17:00:00+08:00"]; ok {
-		t.Fatalf("expected 17:00 project-time bucket to be filtered out, got %+v", snapshot.RequestsByHour)
-	}
 }
 
 func TestBuildUsageOverviewWithFilterRequiresResolvedTimeRange(t *testing.T) {
@@ -345,9 +304,9 @@ func TestBuildUsageOverviewWithFilterUsesStatsForFullHoursAndRawEventsForBoundar
 	events := []entities.UsageEvent{
 		{EventKey: "outside-before", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 10, 0, 0, time.UTC), InputTokens: 99, OutputTokens: 99, TotalTokens: 198},
 		{EventKey: "start-boundary", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 9, 25, 0, 0, time.UTC), InputTokens: 1000, OutputTokens: 500, ReasoningTokens: 100, CachedTokens: 200, TotalTokens: 1800},
-		{EventKey: "full-hour-1", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 10, 0, 0, time.UTC), InputTokens: 2000, OutputTokens: 1000, ReasoningTokens: 50, CachedTokens: 100, TotalTokens: 3150},
-		{EventKey: "full-hour-2", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 10, 50, 0, 0, time.UTC), Failed: true, InputTokens: 500, OutputTokens: 250, ReasoningTokens: 25, CachedTokens: 50, TotalTokens: 825},
-		{EventKey: "full-hour-3", APIGroupKey: "provider-b", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 11, 30, 0, 0, time.UTC), InputTokens: 700, OutputTokens: 300, ReasoningTokens: 30, CachedTokens: 70, TotalTokens: 1100},
+		{EventKey: "full-hour-1", APIGroupKey: "provider-a", Model: "claude-sonnet", ModelAlias: stringPtr("sonnet-alias-a"), AuthIndex: "auth-a", Timestamp: time.Date(2026, 4, 16, 10, 10, 0, 0, time.UTC), InputTokens: 2000, OutputTokens: 1000, ReasoningTokens: 50, CachedTokens: 100, TotalTokens: 3150},
+		{EventKey: "full-hour-2", APIGroupKey: "provider-a", Model: "claude-sonnet", ModelAlias: stringPtr("sonnet-alias-b"), AuthIndex: "auth-b", Timestamp: time.Date(2026, 4, 16, 10, 50, 0, 0, time.UTC), Failed: true, InputTokens: 500, OutputTokens: 250, ReasoningTokens: 25, CachedTokens: 50, TotalTokens: 825},
+		{EventKey: "full-hour-3", APIGroupKey: "provider-b", Model: "claude-sonnet", ModelAlias: stringPtr("sonnet-alias-a"), AuthIndex: "auth-c", Timestamp: time.Date(2026, 4, 16, 11, 30, 0, 0, time.UTC), InputTokens: 700, OutputTokens: 300, ReasoningTokens: 30, CachedTokens: 70, TotalTokens: 1100},
 		{EventKey: "end-boundary", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 12, 35, 0, 0, time.UTC), InputTokens: 400, OutputTokens: 200, ReasoningTokens: 20, CachedTokens: 40, TotalTokens: 660},
 		{EventKey: "outside-after", APIGroupKey: "provider-a", Model: "claude-sonnet", Timestamp: time.Date(2026, 4, 16, 12, 45, 0, 0, time.UTC), InputTokens: 88, OutputTokens: 88, TotalTokens: 176},
 	}
@@ -782,18 +741,6 @@ func TestBuildUsageOverviewFromEventsBuildsSnapshotAndOverviewInOnePass(t *testi
 	if overview.Usage.SuccessCount != 1 || overview.Usage.FailureCount != 1 {
 		t.Fatalf("unexpected usage snapshot success/failure counts: %+v", overview.Usage)
 	}
-	if overview.Usage.APIs["provider-a"].Models["claude-sonnet"].TotalRequests != 1 {
-		t.Fatalf("expected provider/model snapshot to be populated, got %+v", overview.Usage.APIs)
-	}
-	if overview.Usage.APIs["unknown"].Models["unknown"].TotalRequests != 1 {
-		t.Fatalf("expected unknown provider/model snapshot to be populated, got %+v", overview.Usage.APIs)
-	}
-	if details := overview.Usage.APIs["provider-a"].Models["claude-sonnet"].Details; len(details) != 0 {
-		t.Fatalf("expected overview snapshot to skip unreturned details, got %+v", details)
-	}
-	if details := overview.Usage.APIs["unknown"].Models["unknown"].Details; len(details) != 0 {
-		t.Fatalf("expected overview snapshot to skip unreturned unknown-model details, got %+v", details)
-	}
 	if overview.Summary.RequestCount != 2 || overview.Summary.TokenCount != 4950 {
 		t.Fatalf("unexpected summary totals: %+v", overview.Summary)
 	}
@@ -892,10 +839,48 @@ func TestCalculateUsageEventCostDoesNotDoubleChargeReasoningTokens(t *testing.T)
 		CachePricePer1M:      1,
 	}
 
-	cost := calculateUsageEventCost(event, pricing)
+	cost := helper.CalculateUsageEventCost(event, pricing)
 
 	if cost != 46.4 {
 		t.Fatalf("expected reasoning tokens not to be added to completion cost, got %f", cost)
+	}
+}
+
+func TestBuildUsageOverviewCalculatesClaudeCacheReadAndCreationCost(t *testing.T) {
+	start := time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	filter := dto.UsageQueryFilter{
+		StartTime: &start,
+		EndTime:   &end,
+	}
+	event := entities.UsageEvent{
+		EventKey:            "claude-cache-cost",
+		APIGroupKey:         "provider-a",
+		Model:               "claude-sonnet",
+		Timestamp:           time.Date(2026, 4, 16, 9, 30, 0, 0, time.UTC),
+		InputTokens:         1_300_000,
+		OutputTokens:        500_000,
+		CachedTokens:        200_000,
+		CacheReadTokens:     200_000,
+		CacheCreationTokens: 100_000,
+		TotalTokens:         1_800_000,
+	}
+	overview := buildUsageOverviewFromEventsForTest([]entities.UsageEvent{event}, filter, map[string]entities.ModelPriceSetting{
+		"claude-sonnet": {
+			PricingStyle:            entities.ModelPricingStyleClaude,
+			PromptPricePer1M:        10,
+			CompletionPricePer1M:    20,
+			CachePricePer1M:         1,
+			CacheCreationPricePer1M: 12.5,
+		},
+	})
+
+	wantCost := 1.0*10 + 0.5*20 + 0.2*1 + 0.1*12.5
+	if math.Abs(overview.Summary.TotalCost-wantCost) > 0.000000001 {
+		t.Fatalf("expected Claude cache read/write cost %.8f, got %.8f", wantCost, overview.Summary.TotalCost)
+	}
+	if !overview.Summary.CostAvailable {
+		t.Fatalf("expected cost to be available, got %+v", overview.Summary)
 	}
 }
 
@@ -1200,4 +1185,8 @@ func TestBuildUsageOverviewWithFilterUsesDailyBucketsForLongCustomRanges(t *test
 	if _, ok := overview.Series.Requests["2026-04-20T08:00:00Z"]; ok {
 		t.Fatalf("expected long custom range not to keep hourly buckets, got %+v", overview.Series.Requests)
 	}
+}
+
+func stringPtr(value string) *string {
+	return &value
 }

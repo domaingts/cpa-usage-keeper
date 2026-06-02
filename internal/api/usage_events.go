@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"cpa-usage-keeper/internal/entities"
+	"cpa-usage-keeper/internal/helper"
 	"cpa-usage-keeper/internal/service"
 	servicedto "cpa-usage-keeper/internal/service/dto"
 	"cpa-usage-keeper/internal/timeutil"
@@ -34,17 +35,25 @@ type usageEventFilterOptionsResponse struct {
 }
 
 type usageEventPayload struct {
-	ID         string                 `json:"id,omitempty"`
-	Timestamp  string                 `json:"timestamp"`
-	Model      string                 `json:"model"`
-	Source     string                 `json:"source"`
-	SourceRaw  string                 `json:"source_raw,omitempty"`
-	SourceType string                 `json:"source_type,omitempty"`
-	AuthIndex  string                 `json:"auth_index,omitempty"`
-	IsDelete   bool                   `json:"isDelete,omitempty"`
-	Failed     bool                   `json:"failed"`
-	LatencyMS  int64                  `json:"latency_ms"`
-	Tokens     usageEventTokenPayload `json:"tokens"`
+	ID              string                 `json:"id,omitempty"`
+	Timestamp       string                 `json:"timestamp"`
+	APIKey          string                 `json:"api_key,omitempty"`
+	Model           string                 `json:"model"`
+	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
+	ExecutorType    string                 `json:"executor_type,omitempty"`
+	Endpoint        string                 `json:"endpoint,omitempty"`
+	Source          string                 `json:"source"`
+	SourceRaw       string                 `json:"source_raw,omitempty"`
+	SourceType      string                 `json:"source_type,omitempty"`
+	AuthIndex       string                 `json:"auth_index,omitempty"`
+	IsDelete        bool                   `json:"isDelete,omitempty"`
+	Failed          bool                   `json:"failed"`
+	LatencyMS       int64                  `json:"latency_ms"`
+	TTFTMS          *int64                 `json:"ttft_ms,omitempty"`
+	Tokens          usageEventTokenPayload `json:"tokens"`
+	CostUSD         float64                `json:"cost_usd"`
+	CostAvailable   bool                   `json:"cost_available"`
+	PricingStyle    string                 `json:"pricing_style,omitempty"`
 }
 
 type usageEventTokenPayload struct {
@@ -61,6 +70,7 @@ func registerUsageEventsRoute(
 	router gin.IRoutes,
 	usageProvider service.UsageProvider,
 	usageIdentityProvider service.UsageIdentityProvider,
+	cpaAPIKeyProvider service.CPAAPIKeyProvider,
 ) {
 	router.GET("/usage/events/filters/models", func(c *gin.Context) {
 		models, err := loadUsageEventModelFilterOptions(c, usageProvider)
@@ -108,8 +118,12 @@ func registerUsageEventsRoute(
 			return
 		}
 		resolver := newUsageIdentityResolver(identities)
+		apiKeyInfos, err := loadCPAAPIKeyInfos(c, cpaAPIKeyProvider)
+		if err != nil {
+			return
+		}
 		c.JSON(http.StatusOK, usageEventsResponse{
-			Events:     buildUsageEventsPayload(rows.Events, resolver),
+			Events:     buildUsageEventsPayload(rows.Events, resolver, apiKeyInfos),
 			TotalCount: rows.TotalCount,
 			Page:       rows.Page,
 			PageSize:   rows.PageSize,
@@ -133,7 +147,7 @@ func applyUsageEventsSourceFilter(filter *servicedto.UsageFilter) error {
 }
 
 // 列表结果先按 auth_index 解析展示名，再组装前端需要的事件 payload。
-func buildUsageEventsPayload(rows []servicedto.UsageEventRecord, resolver usageIdentityResolver) []usageEventPayload {
+func buildUsageEventsPayload(rows []servicedto.UsageEventRecord, resolver usageIdentityResolver, apiKeyInfos map[string]analysisAPIKeyInfo) []usageEventPayload {
 	if len(rows) == 0 {
 		return []usageEventPayload{}
 	}
@@ -146,15 +160,23 @@ func buildUsageEventsPayload(rows []servicedto.UsageEventRecord, resolver usageI
 			id = strconv.FormatInt(row.ID, 10)
 		}
 		payload = append(payload, usageEventPayload{
-			ID:         id,
-			Timestamp:  timeutil.FormatStorageTime(row.Timestamp),
-			Model:      row.Model,
-			Source:     source,
-			SourceType: identity.Type,
-			AuthIndex:  row.AuthIndex,
-			IsDelete:   isDelete,
-			Failed:     row.Failed,
-			LatencyMS:  row.LatencyMS,
+			ID:              id,
+			Timestamp:       timeutil.FormatStorageTime(row.Timestamp),
+			APIKey:          usageEventAPIKeyLabel(row.APIGroupKey, apiKeyInfos),
+			Model:           row.Model,
+			ReasoningEffort: strings.TrimSpace(row.ReasoningEffort),
+			ExecutorType:    strings.TrimSpace(row.ExecutorType),
+			Endpoint:        strings.TrimSpace(row.Endpoint),
+			Source:          source,
+			SourceType:      identity.Type,
+			AuthIndex:       row.AuthIndex,
+			IsDelete:        isDelete,
+			Failed:          row.Failed,
+			LatencyMS:       row.LatencyMS,
+			TTFTMS:          row.TTFTMS,
+			CostUSD:         row.CostUSD,
+			CostAvailable:   row.CostAvailable,
+			PricingStyle:    strings.TrimSpace(row.PricingStyle),
 			Tokens: usageEventTokenPayload{
 				InputTokens:         row.InputTokens,
 				OutputTokens:        row.OutputTokens,
@@ -167,6 +189,14 @@ func buildUsageEventsPayload(rows []servicedto.UsageEventRecord, resolver usageI
 		})
 	}
 	return payload
+}
+
+func usageEventAPIKeyLabel(apiGroupKey string, apiKeyInfos map[string]analysisAPIKeyInfo) string {
+	apiKey := strings.TrimSpace(apiGroupKey)
+	if apiKey == "" {
+		return ""
+	}
+	return analysisAPIKeyLabel(apiKey, apiKeyInfos)
 }
 
 func usageEventPublicSource(row servicedto.UsageEventRecord, identity resolvedUsageIdentity, matched bool) (string, bool) {
@@ -236,7 +266,7 @@ func usageSourceFilterOptionFromIdentity(identity entities.UsageIdentity) (usage
 			return usageSourceFilterOption{}, false
 		}
 		label := strings.TrimSpace(identity.Name)
-		displayName := usageIdentityDisplayName(identity)
+		displayName := helper.UsageIdentityDisplayName(identity)
 		return usageSourceFilterOption{Value: value, Label: label, DisplayName: displayName}, true
 	default:
 		return usageSourceFilterOption{}, false

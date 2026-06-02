@@ -78,12 +78,21 @@ func ReplaceUsageIdentitiesForProviderTypes(ctx context.Context, db *gorm.DB, id
 }
 
 type ListUsageIdentitiesPageRequest struct {
-	AuthType *entities.UsageIdentityAuthType
-	Page     int
-	PageSize int
+	AuthType   *entities.UsageIdentityAuthType
+	ActiveOnly *bool
+	Types      []string
+	Sort       string
+	Page       int
+	PageSize   int
 }
 
-const usageIdentityReadColumns = "id, name, auth_type, auth_type_name, identity, type, provider, lookup_key, prefix, base_url, account_id, project_id, active_start, active_until, plan_type, total_requests, success_count, failure_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, last_aggregated_usage_event_id, first_used_at, last_used_at, stats_updated_at, is_deleted, created_at, updated_at, deleted_at"
+const (
+	UsageIdentityPageSortPriority      = "priority"
+	UsageIdentityPageSortTotalRequests = "total_requests"
+	UsageIdentityPageSortTotalTokens   = "total_tokens"
+)
+
+const usageIdentityReadColumns = "id, name, auth_type, auth_type_name, identity, type, provider, lookup_key, prefix, base_url, priority, disabled, note, account_id, project_id, active_start, active_until, plan_type, total_requests, success_count, failure_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, last_aggregated_usage_event_id, first_used_at, last_used_at, stats_updated_at, is_deleted, created_at, updated_at, deleted_at"
 
 const usageIdentityAggregationColumns = "id, auth_type, identity, total_requests, success_count, failure_count, input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, last_aggregated_usage_event_id, first_used_at, last_used_at"
 
@@ -113,9 +122,9 @@ func ListActiveUsageIdentities(ctx context.Context, db *gorm.DB) ([]entities.Usa
 	return identities, nil
 }
 
-func ListActiveUsageIdentitiesPage(ctx context.Context, db *gorm.DB, request ListUsageIdentitiesPageRequest) ([]entities.UsageIdentity, int64, error) {
+func ListActiveUsageIdentitiesPage(ctx context.Context, db *gorm.DB, request ListUsageIdentitiesPageRequest) ([]entities.UsageIdentity, int64, []dto.UsageIdentityTypeCount, error) {
 	if db == nil {
-		return nil, 0, fmt.Errorf("database is nil")
+		return nil, 0, nil, fmt.Errorf("database is nil")
 	}
 	page := request.Page
 	if page <= 0 {
@@ -125,18 +134,43 @@ func ListActiveUsageIdentitiesPage(ctx context.Context, db *gorm.DB, request Lis
 	if pageSize <= 0 {
 		pageSize = 10
 	}
+	types := normalizeUsageIdentityTypes(request.Types)
+
+	// type_counts 只受 auth_type/active_only 影响，不受当前 type 筛选影响，方便前端保持完整筛选按钮。
+	typeCounts, err := ListActiveUsageIdentityTypeCounts(ctx, db, request)
+	if err != nil {
+		return nil, 0, nil, err
+	}
 
 	// 先在同一过滤条件下统计总数，再追加 offset/limit 取当前页数据。
-	query := activeUsageIdentitiesQuery(db.WithContext(ctx), request.AuthType)
+	query := activeUsageIdentitiesPageBaseQuery(db.WithContext(ctx), request.AuthType, request.ActiveOnly)
+	query = applyUsageIdentityTypesFilter(query, types)
 	var total int64
 	if err := query.Model(&entities.UsageIdentity{}).Count(&total).Error; err != nil {
-		return nil, 0, fmt.Errorf("count active usage identities page: %w", err)
+		return nil, 0, nil, fmt.Errorf("count active usage identities page: %w", err)
 	}
 	var identities []entities.UsageIdentity
-	if err := query.Select(usageIdentityReadColumns).Order("total_requests DESC").Order("id ASC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&identities).Error; err != nil {
-		return nil, 0, fmt.Errorf("list active usage identities page: %w", err)
+	if err := applyUsageIdentityPageSort(query.Select(usageIdentityReadColumns), request.Sort, request.AuthType).Offset((page - 1) * pageSize).Limit(pageSize).Find(&identities).Error; err != nil {
+		return nil, 0, nil, fmt.Errorf("list active usage identities page: %w", err)
 	}
-	return identities, total, nil
+	return identities, total, typeCounts, nil
+}
+
+func ListActiveUsageIdentityTypeCounts(ctx context.Context, db *gorm.DB, request ListUsageIdentitiesPageRequest) ([]dto.UsageIdentityTypeCount, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database is nil")
+	}
+	var counts []dto.UsageIdentityTypeCount
+	// 按数据库原始 type 聚合，不做 lower/alias/归一化；展示归并交给前端映射层。
+	if err := activeUsageIdentitiesPageBaseQuery(db.WithContext(ctx), request.AuthType, request.ActiveOnly).
+		Model(&entities.UsageIdentity{}).
+		Select("type, COUNT(*) AS count").
+		Group("type").
+		Order("type ASC").
+		Scan(&counts).Error; err != nil {
+		return nil, fmt.Errorf("count active usage identity types: %w", err)
+	}
+	return counts, nil
 }
 
 func activeUsageIdentitiesQuery(db *gorm.DB, authType *entities.UsageIdentityAuthType) *gorm.DB {
@@ -146,6 +180,41 @@ func activeUsageIdentitiesQuery(db *gorm.DB, authType *entities.UsageIdentityAut
 		query = query.Where("auth_type = ?", *authType)
 	}
 	return query
+}
+
+func activeUsageIdentitiesPageBaseQuery(db *gorm.DB, authType *entities.UsageIdentityAuthType, activeOnly *bool) *gorm.DB {
+	query := activeUsageIdentitiesQuery(db, authType)
+	if activeOnly != nil && *activeOnly {
+		query = query.Where("disabled IS NULL OR disabled = ?", false)
+	}
+	return query
+}
+
+func applyUsageIdentityTypesFilter(query *gorm.DB, types []string) *gorm.DB {
+	switch len(types) {
+	case 0:
+		return query
+	case 1:
+		return query.Where("type = ?", types[0])
+	default:
+		return query.Where("type IN ?", types)
+	}
+}
+
+func applyUsageIdentityPageSort(query *gorm.DB, sort string, authType *entities.UsageIdentityAuthType) *gorm.DB {
+	switch sort {
+	case UsageIdentityPageSortPriority:
+		// Auth Files 的 priority 同分需要稳定按名称排列；AI Provider 只保留同步顺序兜底。
+		query = query.Order("priority IS NULL ASC").Order("priority DESC")
+		if authType != nil && *authType == entities.UsageIdentityAuthTypeAuthFile {
+			query = query.Order("LOWER(name) ASC")
+		}
+		return query.Order("id ASC")
+	case UsageIdentityPageSortTotalTokens:
+		return query.Order("total_tokens DESC").Order("id ASC")
+	default:
+		return query.Order("total_requests DESC").Order("id ASC")
+	}
 }
 
 func GetActiveAuthFileUsageIdentityByAuthIndex(ctx context.Context, db *gorm.DB, authIndex string) (entities.UsageIdentity, error) {
@@ -310,6 +379,7 @@ func normalizeUsageIdentities(identities []entities.UsageIdentity, authType enti
 		identity.LookupKey = strings.TrimSpace(identity.LookupKey)
 		identity.Prefix = strings.TrimSpace(identity.Prefix)
 		identity.BaseURL = strings.TrimSpace(identity.BaseURL)
+		identity.Note = trimOptionalString(identity.Note)
 		identity.AccountID = trimOptionalString(identity.AccountID)
 		identity.ProjectID = trimOptionalString(identity.ProjectID)
 		identity.PlanType = trimOptionalString(identity.PlanType)
@@ -362,6 +432,23 @@ func normalizeProviderTypes(providerTypes []string) []string {
 		}
 		seen[providerType] = struct{}{}
 		types = append(types, providerType)
+	}
+	return types
+}
+
+func normalizeUsageIdentityTypes(identityTypes []string) []string {
+	seen := make(map[string]struct{}, len(identityTypes))
+	types := make([]string, 0, len(identityTypes))
+	for _, identityType := range identityTypes {
+		identityType = strings.TrimSpace(identityType)
+		if identityType == "" {
+			continue
+		}
+		if _, ok := seen[identityType]; ok {
+			continue
+		}
+		seen[identityType] = struct{}{}
+		types = append(types, identityType)
 	}
 	return types
 }
@@ -454,6 +541,9 @@ func usageIdentityMetadataUpdates(identity entities.UsageIdentity) map[string]an
 		"lookup_key":     identity.LookupKey,
 		"prefix":         identity.Prefix,
 		"base_url":       identity.BaseURL,
+		"priority":       identity.Priority,
+		"disabled":       identity.Disabled,
+		"note":           identity.Note,
 		"account_id":     identity.AccountID,
 		"project_id":     identity.ProjectID,
 		"active_start":   identity.ActiveStart,

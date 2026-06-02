@@ -13,6 +13,8 @@ func TestDecodeRedisUsageMessageMapsPayloadToUsageEvent(t *testing.T) {
 	event, raw, err := DecodeRedisUsageMessage(`{
 		"timestamp":"2026-04-27T07:59:00Z",
 		"latency_ms":1234,
+		"ttft_ms":456,
+		"service_tier":"standard",
 		"source":"sk-test",
 		"auth_index":"auth-1",
 		"tokens":{"input_tokens":10,"output_tokens":20,"reasoning_tokens":3,"cached_tokens":4,"cache_read_tokens":5,"cache_creation_tokens":6,"total_tokens":0},
@@ -20,6 +22,8 @@ func TestDecodeRedisUsageMessageMapsPayloadToUsageEvent(t *testing.T) {
 		"provider":"claude",
 		"model":"claude-sonnet-4-6",
 		"alias":"claude-sonnet-alias",
+		"reasoning_effort":"medium",
+		"executor_type":"responses",
 		"endpoint":"/v1/messages",
 		"auth_type":"api_key",
 		"api_key":"raw-key",
@@ -32,13 +36,25 @@ func TestDecodeRedisUsageMessageMapsPayloadToUsageEvent(t *testing.T) {
 	if event.EventKey != "req-123" || event.APIGroupKey != "raw-key" || event.Model != "claude-sonnet-4-6" || event.Source != "sk-test" || event.AuthIndex != "auth-1" || !event.Failed || event.LatencyMS != 1234 {
 		t.Fatalf("unexpected event: %+v", event)
 	}
+	if event.TTFTMS == nil || *event.TTFTMS != 456 {
+		t.Fatalf("expected ttft_ms to decode, got %+v", event.TTFTMS)
+	}
 	if event.Provider != "claude" || event.Endpoint != "/v1/messages" || event.AuthType != "apikey" || event.RequestID != "req-123" {
 		t.Fatalf("unexpected redis identity fields: %+v", event)
 	}
 	if event.ModelAlias == nil || *event.ModelAlias != "claude-sonnet-alias" {
 		t.Fatalf("expected model alias to decode, got %+v", event.ModelAlias)
 	}
-	if event.InputTokens != 10 || event.OutputTokens != 20 || event.ReasoningTokens != 3 || event.CachedTokens != 4 || event.CacheReadTokens != 5 || event.CacheCreationTokens != 6 || event.TotalTokens != 33 {
+	if event.ReasoningEffort != "medium" {
+		t.Fatalf("expected reasoning effort to decode, got %q", event.ReasoningEffort)
+	}
+	if event.ExecutorType != "responses" {
+		t.Fatalf("expected executor type to decode, got %q", event.ExecutorType)
+	}
+	if event.ServiceTier != "standard" {
+		t.Fatalf("expected service tier to decode, got %q", event.ServiceTier)
+	}
+	if event.InputTokens != 10 || event.OutputTokens != 20 || event.ReasoningTokens != 3 || event.CachedTokens != 4 || event.CacheReadTokens != 5 || event.CacheCreationTokens != 6 || event.TotalTokens != 0 {
 		t.Fatalf("unexpected tokens: %+v", event)
 	}
 	if !event.Timestamp.Equal(time.Date(2026, 4, 27, 7, 59, 0, 0, time.UTC)) {

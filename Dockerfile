@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:26-alpine3.22 AS web-builder
+FROM node:26-alpine AS web-builder
 WORKDIR /app/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
@@ -16,9 +16,12 @@ COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY --from=web-builder /app/web/dist ./web/dist
 COPY web/static.go ./web/static.go
-RUN CGO_ENABLED=1 GOOS=linux go build -o /out/cpa-usage-keeper ./cmd/server/main.go
+ARG VERSION=dev
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags="-s -w -X cpa-usage-keeper/internal/version.Version=${VERSION}" \
+    -o /out/cpa-usage-keeper ./cmd/server/main.go
 
-FROM alpine:3.22
+FROM alpine:3.23
 WORKDIR /
 RUN apk add --no-cache ca-certificates tzdata su-exec \
 	&& addgroup -S app \
@@ -27,7 +30,8 @@ RUN apk add --no-cache ca-certificates tzdata su-exec \
 	&& chown -R app:app /data
 COPY --from=go-builder /out/cpa-usage-keeper /app/cpa-usage-keeper
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+	&& chmod +x /usr/local/bin/docker-entrypoint.sh
 VOLUME ["/data"]
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD wget -q --spider "http://127.0.0.1:${APP_PORT:-8080}${APP_BASE_PATH:-}/healthz" || exit 1

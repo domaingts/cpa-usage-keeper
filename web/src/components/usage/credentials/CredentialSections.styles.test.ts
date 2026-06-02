@@ -29,21 +29,35 @@ describe('Credential section styles', () => {
     expect(credentialStyles).toMatch(/\.credentialQuotaBars\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2, minmax\(150px, 1fr\)\);/)
     expect(credentialStyles).toMatch(/\.credentialQuotaBars\s*\{[\s\S]*?gap:\s*14px;/)
     expect(credentialStyles).toMatch(/\.credentialQuotaBarBlock\s*\{[\s\S]*?min-width:\s*150px;/)
+    expect(credentialStyles).not.toContain('credentialQuotaChips')
+    expect(credentialStyles).not.toContain('credentialQuotaChip')
     expect(credentialStyles).not.toContain('credentialQuotaSidePanel')
     expect(credentialStyles).not.toContain('credentialQuotaRow')
   })
 
   it('keeps Auth Files quota actions inside the mobile card boundary', () => {
     expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialQuotaSideWithAction\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) auto;/)
-    expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialQuotaBars\s*\{[\s\S]*?grid-template-columns:\s*repeat\(auto-fit, minmax\(min\(100%, 120px\), 1fr\)\);/)
+    expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialQuotaBars\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\);/)
     expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialQuotaBarBlock\s*\{[\s\S]*?min-width:\s*0;/)
   })
 
-  it('keeps Total Requests success and failure counts horizontally aligned', () => {
-    expect(credentialStyles).toMatch(/\.credentialRequestMetric\s*\{[\s\S]*?align-items:\s*center;/)
+  it('renders compact priority badges without lengthening credential names', () => {
+    expect(credentialStyles).toMatch(/\.credentialPriorityBadge\s*\{[\s\S]*?min-width:\s*22px;/)
+    expect(credentialShellSource).toContain('CredentialPriorityBadge')
+    expect(authFileSectionSource).toContain('row.priorityLabel')
+    expect(authFileSectionSource).toMatch(/row\.planTypeLabel[\s\S]*?row\.remainingDaysLabel[\s\S]*?row\.priorityLabel/)
+    expect(aiProviderSectionSource).toContain('row.priorityLabel')
+  })
+
+  it('keeps Total Requests fixed and wraps the breakdown only when it overflows', () => {
+    expect(credentialStyles).toMatch(/\.credentialMetricGroup\s*\{[\s\S]*?grid-template-columns:\s*109px repeat\(3, 95px\);/)
+    expect(credentialStyles).toMatch(/\.credentialRequestMetric\s*\{[\s\S]*?align-items:\s*baseline;/)
+    expect(credentialStyles).toMatch(/\.credentialRequestMetric\s*\{[\s\S]*?flex-wrap:\s*wrap;/)
+    expect(credentialStyles).toMatch(/\.credentialRequestMetric\s*\{[\s\S]*?white-space:\s*normal;/)
     expect(credentialStyles).toMatch(/\.credentialRequestBreakdown\s*\{[\s\S]*?display:\s*inline-flex;/)
-    expect(credentialStyles).toMatch(/\.credentialRequestBreakdown\s*\{[\s\S]*?align-items:\s*center;/)
-    expect(credentialStyles).toMatch(/\.credentialRequestBreakdown\s*\{[\s\S]*?line-height:\s*1;/)
+    expect(credentialStyles).toMatch(/\.credentialRequestBreakdown\s*\{[\s\S]*?white-space:\s*nowrap;/)
+    expect(credentialStyles).not.toMatch(/\.credentialRequestBreakdown\s*\{[\s\S]*?flex-basis:\s*100%;/)
+    expect(credentialStyles).toMatch(/\.credentialRequestBreakdown\s*\{[\s\S]*?line-height:\s*1\.2;/)
   })
 
   it('uses a fixed centered pagination bar height', () => {
@@ -52,6 +66,9 @@ describe('Credential section styles', () => {
     expect(credentialStyles).toMatch(/\.credentialPagination\s*\{[\s\S]*?box-sizing:\s*border-box;/)
     expect(credentialStyles).toMatch(/\.credentialPagination\s*\{[\s\S]*?align-items:\s*center;/)
     expect(credentialStyles).toMatch(/\.credentialPagination\s*\{[\s\S]*?padding:\s*0 22px;/)
+    expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialPagination\s*\{[\s\S]*?overflow-x:\s*auto;/)
+    expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialPaginationControls\s*\{[\s\S]*?width:\s*max-content;/)
+    expect(credentialStyles).toMatch(/@include mobile\s*\{[\s\S]*?\.credentialPageSizeControl\s*\{[\s\S]*?flex:\s*0 0 auto;/)
   })
 
   it('keeps plan and remaining-day badges readable in dark mode', () => {

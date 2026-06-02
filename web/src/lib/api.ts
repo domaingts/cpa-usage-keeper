@@ -1,4 +1,4 @@
-import { type AnalysisResponse, type AuthSessionResponse, type CpaApiKeyOptionsResponse, type CpaApiKeySettingsItem, type CpaApiKeysResponse, type PricingEntry, type PricingResponse, type StatusResponse, type UpdateCheckResponse, type UsageEventModelFilterOptionsResponse, type UsageEventSourceFilterOptionsResponse, type UsedModelsResponse, type UsageIdentitiesPageResponse, type UsageIdentitiesResponse, type UsageEventsResponse, type UsageIdentityAuthType, type UsageOverviewResponse, type UsageQuotaCacheResponse, type UsageQuotaRefreshResponse, type UsageQuotaRefreshTaskResponse } from './types'
+import { type AnalysisResponse, type AuthSessionResponse, type CpaApiKeyOptionsResponse, type CpaApiKeySettingsItem, type CpaApiKeysResponse, type KeyOverviewTimeRange, type PricingEntry, type PricingResponse, type StatusResponse, type UpdateCheckResponse, type UsageEventModelFilterOptionsResponse, type UsageEventSourceFilterOptionsResponse, type UsedModelsResponse, type UsageIdentitiesPageResponse, type UsageIdentitiesResponse, type UsageEventsResponse, type UsageIdentityAuthType, type UsageOverviewResponse, type UsageQuotaCacheResponse, type UsageQuotaRefreshResponse, type UsageQuotaRefreshTaskResponse } from './types'
 
 export class ApiError extends Error {
   status: number
@@ -23,6 +23,11 @@ function normalizeBasePath(basePath: string | undefined): string {
     return ''
   }
   return basePath.endsWith('/') ? basePath.slice(0, -1) : basePath
+}
+
+export function appPath(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  return `${normalizeBasePath(window.__APP_BASE_PATH__)}${normalizedPath}`
 }
 
 export function apiPath(path: string): string {
@@ -69,6 +74,38 @@ export async function login(password: string): Promise<void> {
   if (!response.ok) {
     await parseApiError(response, `Failed to login: ${response.status}`)
   }
+}
+
+export async function loginWithCPAAPIKey(apiKey: string): Promise<void> {
+  const response = await apiFetch(apiPath('/auth/api-key-login'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ apiKey }),
+  })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to login with CPA API key: ${response.status}`)
+  }
+}
+
+export async function logout(): Promise<void> {
+  const response = await apiFetch(apiPath('/auth/logout'), {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to logout: ${response.status}`)
+  }
+}
+
+export async function fetchKeyOverview(range: KeyOverviewTimeRange, signal?: AbortSignal): Promise<UsageOverviewResponse> {
+  const params = new URLSearchParams()
+  params.set('range', range)
+  const response = await apiFetch(`${apiPath('/key-overview')}?${params.toString()}`, { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to load key overview: ${response.status}`)
+  }
+  return response.json()
 }
 
 export async function fetchUsageOverview(range: string, start?: string, end?: string, signal?: AbortSignal, apiKeyId?: string): Promise<UsageOverviewResponse> {
@@ -156,8 +193,13 @@ export async function fetchUsageEvents(range: string, start?: string, end?: stri
   return response.json()
 }
 
+export type UsageIdentityPageSort = 'priority' | 'total_requests' | 'total_tokens'
+
 export interface FetchUsageIdentitiesPageOptions {
   authType?: UsageIdentityAuthType
+  activeOnly?: boolean
+  types?: string[]
+  sort?: UsageIdentityPageSort
   page?: number
   pageSize?: number
 }
@@ -175,6 +217,17 @@ export async function fetchUsageIdentitiesPage(signal?: AbortSignal, options?: F
   const params = new URLSearchParams()
   if (options?.authType) {
     params.set('auth_type', String(options.authType))
+  }
+  if (typeof options?.activeOnly === 'boolean') {
+    params.set('active_only', String(options.activeOnly))
+  }
+  if (options?.sort) {
+    params.set('sort', options.sort)
+  }
+  for (const type of options?.types ?? []) {
+    if (type !== '') {
+      params.append('type', type)
+    }
   }
   if (typeof options?.page === 'number' && Number.isFinite(options.page) && options.page > 0) {
     params.set('page', String(Math.floor(options.page)))
@@ -222,8 +275,8 @@ export async function refreshUsageQuotas(authIndexes: string[], signal?: AbortSi
   return response.json()
 }
 
-export async function fetchUsageQuotaRefreshTask(taskId: string, signal?: AbortSignal): Promise<UsageQuotaRefreshTaskResponse> {
-  const response = await apiFetch(apiPath(`/quota/refresh/${encodeURIComponent(taskId)}`), { signal })
+export async function fetchUsageQuotaRefreshTask(authIndex: string, signal?: AbortSignal): Promise<UsageQuotaRefreshTaskResponse> {
+  const response = await apiFetch(apiPath(`/quota/refresh/${encodeURIComponent(authIndex)}`), { signal })
   if (!response.ok) {
     await parseApiError(response, `Failed to load usage quota refresh task: ${response.status}`)
   }
@@ -296,6 +349,13 @@ export async function fetchStatus(signal?: AbortSignal): Promise<StatusResponse>
     await parseApiError(response, `Failed to load status: ${response.status}`)
   }
   return response.json()
+}
+
+export async function markStatusActive(signal?: AbortSignal): Promise<void> {
+  const response = await apiFetch(apiPath('/status/active'), { signal })
+  if (!response.ok) {
+    await parseApiError(response, `Failed to mark backend page activity: ${response.status}`)
+  }
 }
 
 export async function fetchUpdateCheck(signal?: AbortSignal): Promise<UpdateCheckResponse> {

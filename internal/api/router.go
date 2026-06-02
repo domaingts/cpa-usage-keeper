@@ -26,16 +26,26 @@ type StatusProvider interface {
 	Status() poller.Status
 }
 
+type ActiveStatusRecorder interface {
+	RecordActiveStatus(time.Time)
+}
+
 type QuotaProvider interface {
 	GetCachedQuota(context.Context, quota.CacheRequest) (quota.CacheResponse, error)
 	Refresh(context.Context, quota.RefreshRequest) (quota.RefreshResponse, error)
-	GetRefreshTask(context.Context, string) (quota.RefreshTaskResponse, error)
+	GetRefreshTaskByAuthIndex(context.Context, string) (quota.RefreshTaskResponse, error)
+}
+
+type StatusRouteConfig struct {
+	CPAPublicURL   string
+	ActiveRecorder ActiveStatusRecorder
 }
 
 type OptionalProviders struct {
 	UsageIdentity service.UsageIdentityProvider
 	Quota         QuotaProvider
 	CPAAPIKeys    service.CPAAPIKeyProvider
+	Status        StatusRouteConfig
 }
 
 func NewRouter(
@@ -69,23 +79,30 @@ func NewRouter(
 	var usageIdentityProvider service.UsageIdentityProvider
 	var quotaProvider QuotaProvider
 	var cpaAPIKeyProvider service.CPAAPIKeyProvider
+	var statusConfig StatusRouteConfig
 	if len(optionalProviders) > 0 {
 		usageIdentityProvider = optionalProviders[0].UsageIdentity
 		quotaProvider = optionalProviders[0].Quota
 		cpaAPIKeyProvider = optionalProviders[0].CPAAPIKeys
+		statusConfig = optionalProviders[0].Status
 	}
+	authHandler.setCPAAPIKeyProvider(cpaAPIKeyProvider)
 
-	protected := apiV1.Group("")
-	protected.Use(authHandler.middleware())
-	registerStatusRoutes(protected, statusProvider)
-	registerUpdateRoutes(protected, nil)
-	registerUsageOverviewRoute(protected, usageProvider)
-	registerUsageAnalysisRoute(protected, usageProvider, cpaAPIKeyProvider)
-	registerUsageEventsRoute(protected, usageProvider, usageIdentityProvider)
-	registerUsageIdentityRoutes(protected, usageIdentityProvider)
-	registerCPAAPIKeyRoutes(protected, cpaAPIKeyProvider)
-	registerPricingRoutes(protected, pricingProvider)
-	registerQuotaRoutes(protected, quotaProvider)
+	adminProtected := apiV1.Group("")
+	adminProtected.Use(authHandler.adminMiddleware())
+	registerStatusRoutes(adminProtected, statusProvider, statusConfig)
+	registerUpdateRoutes(adminProtected, nil)
+	registerUsageOverviewRoute(adminProtected, usageProvider)
+	registerUsageAnalysisRoute(adminProtected, usageProvider, cpaAPIKeyProvider)
+	registerUsageEventsRoute(adminProtected, usageProvider, usageIdentityProvider, cpaAPIKeyProvider)
+	registerUsageIdentityRoutes(adminProtected, usageIdentityProvider)
+	registerCPAAPIKeyRoutes(adminProtected, cpaAPIKeyProvider)
+	registerPricingRoutes(adminProtected, pricingProvider)
+	registerQuotaRoutes(adminProtected, quotaProvider)
+
+	keyViewerProtected := apiV1.Group("")
+	keyViewerProtected.Use(authHandler.apiKeyViewerMiddleware())
+	registerKeyOverviewRoute(keyViewerProtected, usageProvider, cpaAPIKeyProvider, authHandler)
 
 	if staticFS != nil {
 		if indexFile, err := staticFS.Open("index.html"); err == nil {
@@ -217,30 +234,39 @@ type statusResponse struct {
 	Timezone           string     `json:"timezone"`
 	Version            string     `json:"version"`
 	UpdateCheckEnabled bool       `json:"updateCheckEnabled"`
+	CPAPublicURL       string     `json:"cpa_public_url,omitempty"`
 	LastRunAt          *time.Time `json:"last_run_at,omitempty"`
 	LastError          string     `json:"last_error,omitempty"`
 	LastWarning        string     `json:"last_warning,omitempty"`
 	LastStatus         string     `json:"last_status,omitempty"`
 }
 
-func registerStatusRoutes(router gin.IRoutes, statusProvider StatusProvider) {
+func registerStatusRoutes(router gin.IRoutes, statusProvider StatusProvider, config StatusRouteConfig) {
 	router.GET("/status", func(c *gin.Context) {
 		if statusProvider == nil {
-			c.JSON(http.StatusOK, buildStatusResponse(poller.Status{}))
+			c.JSON(http.StatusOK, buildStatusResponse(poller.Status{}, config))
 			return
 		}
 
-		c.JSON(http.StatusOK, buildStatusResponse(statusProvider.Status()))
+		c.JSON(http.StatusOK, buildStatusResponse(statusProvider.Status(), config))
+	})
+	router.GET("/status/active", func(c *gin.Context) {
+		if config.ActiveRecorder != nil {
+			// 前端可见页面用这个轻量心跳续约，避免限额自动刷新在无人查看后台时持续扫库和请求上游。
+			config.ActiveRecorder.RecordActiveStatus(time.Now())
+		}
+		c.Status(http.StatusNoContent)
 	})
 }
 
-func buildStatusResponse(status poller.Status) statusResponse {
+func buildStatusResponse(status poller.Status, config StatusRouteConfig) statusResponse {
 	response := statusResponse{
 		Running:            status.Running,
 		SyncRunning:        status.SyncRunning,
 		Timezone:           time.Local.String(),
 		Version:            version.Version,
 		UpdateCheckEnabled: updatecheck.IsStableVersion(version.Version),
+		CPAPublicURL:       config.CPAPublicURL,
 		LastError:          status.LastError,
 		LastWarning:        status.LastWarning,
 		LastStatus:         status.LastStatus,

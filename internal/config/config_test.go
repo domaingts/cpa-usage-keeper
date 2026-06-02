@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -11,11 +13,11 @@ import (
 )
 
 var configEnvKeys = []string{
-	"APP_PORT", "APP_BASE_PATH", "WORK_DIR", "CPA_BASE_URL", "CPA_MANAGEMENT_KEY", "POLL_INTERVAL",
+	"APP_PORT", "APP_BASE_PATH", "CPA_PUBLIC_URL", "WORK_DIR", "CPA_BASE_URL", "CPA_MANAGEMENT_KEY", "POLL_INTERVAL",
 	"USAGE_SYNC_MODE", "REDIS_QUEUE_ADDR", "REDIS_QUEUE_TLS", "REDIS_QUEUE_BATCH_SIZE", "REDIS_QUEUE_IDLE_INTERVAL",
 	"SQLITE_PATH", "BACKUP_ENABLED", "BACKUP_DIR", "BACKUP_INTERVAL", "BACKUP_RETENTION_DAYS",
 	"REQUEST_TIMEOUT", "LOG_LEVEL", "LOG_FILE_ENABLED", "LOG_DIR", "LOG_RETENTION_DAYS",
-	"AUTH_ENABLED", "LOGIN_PASSWORD", "AUTH_SESSION_TTL", "TZ", "TLS_SKIP_VERIFY",
+	"AUTH_ENABLED", "LOGIN_PASSWORD", "AUTH_SESSION_TTL", "TZ", "TLS_SKIP_VERIFY", "QUOTA_REFRESH_WORKER_LIMIT", "QUOTA_AUTO_REFRESH_ENABLED", "QUOTA_AUTO_REFRESH_INTERVAL",
 }
 
 func TestMain(m *testing.M) {
@@ -99,6 +101,9 @@ func TestLoadFromEnvAppliesDefaults(t *testing.T) {
 	if cfg.AppBasePath != "" {
 		t.Fatalf("expected default app base path to be empty, got %q", cfg.AppBasePath)
 	}
+	if cfg.CPAPublicURL != "" {
+		t.Fatalf("expected default CPA public URL to be empty, got %q", cfg.CPAPublicURL)
+	}
 	if !cfg.BackupEnabled {
 		t.Fatal("expected backup to be enabled by default")
 	}
@@ -138,17 +143,23 @@ func TestLoadFromEnvAppliesDefaults(t *testing.T) {
 	if cfg.RedisQueueKey != RedisQueueKeyDefault {
 		t.Fatalf("expected default redis queue key queue, got %s", cfg.RedisQueueKey)
 	}
-	if cfg.RedisQueueBatchSize != 1000 {
-		t.Fatalf("expected default redis queue batch size 1000, got %d", cfg.RedisQueueBatchSize)
+	if cfg.RedisQueueBatchSize != 10000 {
+		t.Fatalf("expected default redis queue batch size 10000, got %d", cfg.RedisQueueBatchSize)
 	}
 	if cfg.RedisQueueIdleInterval != time.Second {
 		t.Fatalf("expected default redis queue idle interval 1s, got %s", cfg.RedisQueueIdleInterval)
 	}
-	if cfg.RedisQueueErrorBackoff != RedisQueueErrorBackoffDefault {
-		t.Fatalf("expected default redis queue error backoff 10s, got %s", cfg.RedisQueueErrorBackoff)
-	}
 	if cfg.MetadataSyncInterval != MetadataSyncIntervalDefault {
 		t.Fatalf("expected default metadata sync interval 30s, got %s", cfg.MetadataSyncInterval)
+	}
+	if cfg.QuotaRefreshWorkerLimit != 10 {
+		t.Fatalf("expected default quota refresh worker limit 10, got %d", cfg.QuotaRefreshWorkerLimit)
+	}
+	if cfg.QuotaAutoRefreshEnabled {
+		t.Fatal("expected quota auto refresh to be disabled by default")
+	}
+	if cfg.QuotaAutoRefreshInterval != 5*time.Minute {
+		t.Fatalf("expected default quota auto refresh interval 5m, got %s", cfg.QuotaAutoRefreshInterval)
 	}
 	if !cfg.LogFileEnabled {
 		t.Fatal("expected log file output to be enabled by default")
@@ -424,12 +435,25 @@ func TestLoadFromEnvRejectsNonPositiveRedisQueueBatchSize(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvRejectsOversizedRedisQueueBatchSize(t *testing.T) {
+	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
+	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
+	t.Setenv("REDIS_QUEUE_BATCH_SIZE", strconv.Itoa(cpa.ManagementUsageQueueMaxBatchSize+1))
+
+	_, err := LoadFromEnv()
+	expected := fmt.Sprintf("REDIS_QUEUE_BATCH_SIZE must be <= %d", cpa.ManagementUsageQueueMaxBatchSize)
+	if err == nil || err.Error() != expected {
+		t.Fatalf("expected REDIS_QUEUE_BATCH_SIZE max validation error, got %v", err)
+	}
+}
+
 func TestLoadFromEnvParsesOverrides(t *testing.T) {
 	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
 	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
 	t.Setenv("WORK_DIR", "/tmp/work")
 	t.Setenv("APP_PORT", "9090")
 	t.Setenv("APP_BASE_PATH", "/cpa/")
+	t.Setenv("CPA_PUBLIC_URL", "https://cpa.public.example.com/")
 	t.Setenv("BACKUP_ENABLED", "false")
 	t.Setenv("BACKUP_INTERVAL", "2h")
 	t.Setenv("BACKUP_RETENTION_DAYS", "7")
@@ -443,6 +467,9 @@ func TestLoadFromEnvParsesOverrides(t *testing.T) {
 	t.Setenv("REDIS_QUEUE_IDLE_INTERVAL", "2s")
 	t.Setenv("TLS_SKIP_VERIFY", "true")
 	t.Setenv("REDIS_QUEUE_TLS", "true")
+	t.Setenv("QUOTA_REFRESH_WORKER_LIMIT", "8")
+	t.Setenv("QUOTA_AUTO_REFRESH_ENABLED", "true")
+	t.Setenv("QUOTA_AUTO_REFRESH_INTERVAL", "2m")
 
 	cfg, err := LoadFromEnv()
 	if err != nil {
@@ -455,7 +482,7 @@ func TestLoadFromEnvParsesOverrides(t *testing.T) {
 	if !cfg.RedisQueueTLS {
 		t.Fatal("expected redis queue TLS to be enabled when set to true")
 	}
-	if cfg.AppPort != "9090" || cfg.AppBasePath != "/cpa" || cfg.WorkDir != "/tmp/work" || cfg.SQLitePath != filepath.Join("/tmp/work", "app.db") || cfg.BackupEnabled || cfg.BackupDir != filepath.Join("/tmp/work", "backups") || cfg.BackupInterval != 2*time.Hour || cfg.BackupRetentionDays != 7 || cfg.RequestTimeout != 15*time.Second || cfg.LogLevel != "debug" || cfg.LogFileEnabled || cfg.LogDir != filepath.Join("/tmp/work", "logs") || cfg.LogRetentionDays != 14 || !cfg.AuthEnabled || cfg.LoginPassword != "top-secret" || cfg.AuthSessionTTL != 12*time.Hour || cfg.RedisQueueIdleInterval != 2*time.Second {
+	if cfg.AppPort != "9090" || cfg.AppBasePath != "/cpa" || cfg.CPAPublicURL != "https://cpa.public.example.com/" || cfg.WorkDir != "/tmp/work" || cfg.SQLitePath != filepath.Join("/tmp/work", "app.db") || cfg.BackupEnabled || cfg.BackupDir != filepath.Join("/tmp/work", "backups") || cfg.BackupInterval != 2*time.Hour || cfg.BackupRetentionDays != 7 || cfg.RequestTimeout != 15*time.Second || cfg.LogLevel != "debug" || cfg.LogFileEnabled || cfg.LogDir != filepath.Join("/tmp/work", "logs") || cfg.LogRetentionDays != 14 || !cfg.AuthEnabled || cfg.LoginPassword != "top-secret" || cfg.AuthSessionTTL != 12*time.Hour || cfg.RedisQueueIdleInterval != 2*time.Second || cfg.QuotaRefreshWorkerLimit != 8 || !cfg.QuotaAutoRefreshEnabled || cfg.QuotaAutoRefreshInterval != 2*time.Minute {
 		t.Fatalf("unexpected config override result: %+v", cfg)
 	}
 }
@@ -497,6 +524,39 @@ func TestLoadFromEnvRejectsNegativeLogRetentionDays(t *testing.T) {
 	}
 }
 
+func TestLoadFromEnvRejectsOversizedQuotaRefreshWorkerLimit(t *testing.T) {
+	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
+	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
+	t.Setenv("QUOTA_REFRESH_WORKER_LIMIT", "101")
+
+	_, err := LoadFromEnv()
+	if err == nil || err.Error() != "QUOTA_REFRESH_WORKER_LIMIT must be <= 100" {
+		t.Fatalf("expected QUOTA_REFRESH_WORKER_LIMIT max validation error, got %v", err)
+	}
+}
+
+func TestLoadFromEnvRejectsTooShortQuotaAutoRefreshInterval(t *testing.T) {
+	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
+	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
+	t.Setenv("QUOTA_AUTO_REFRESH_INTERVAL", "59s")
+
+	_, err := LoadFromEnv()
+	if err == nil || err.Error() != "QUOTA_AUTO_REFRESH_INTERVAL must be >= 60s" {
+		t.Fatalf("expected QUOTA_AUTO_REFRESH_INTERVAL validation error, got %v", err)
+	}
+}
+
+func TestLoadFromEnvRejectsNonPositiveQuotaRefreshWorkerLimit(t *testing.T) {
+	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
+	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
+	t.Setenv("QUOTA_REFRESH_WORKER_LIMIT", "0")
+
+	_, err := LoadFromEnv()
+	if err == nil || err.Error() != "QUOTA_REFRESH_WORKER_LIMIT must be positive" {
+		t.Fatalf("expected QUOTA_REFRESH_WORKER_LIMIT validation error, got %v", err)
+	}
+}
+
 func TestLoadFromEnvRejectsNonPositiveRedisQueueIdleInterval(t *testing.T) {
 	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
 	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
@@ -508,18 +568,17 @@ func TestLoadFromEnvRejectsNonPositiveRedisQueueIdleInterval(t *testing.T) {
 	}
 }
 
-func TestLoadFromEnvIgnoresRemovedRedisDrainEnvOverrides(t *testing.T) {
+func TestLoadFromEnvIgnoresRemovedMetadataSyncIntervalOverride(t *testing.T) {
 	t.Setenv("CPA_BASE_URL", "http://127.0.0.1:"+cpa.ManagementRedisDefaultPort)
 	t.Setenv("CPA_MANAGEMENT_KEY", "secret")
-	t.Setenv("REDIS_QUEUE_ERROR_BACKOFF", "20s")
 	t.Setenv("REDIS_METADATA_SYNC_INTERVAL", "45s")
 
 	cfg, err := LoadFromEnv()
 	if err != nil {
 		t.Fatalf("LoadFromEnv returned error: %v", err)
 	}
-	if cfg.RedisQueueErrorBackoff != RedisQueueErrorBackoffDefault || cfg.MetadataSyncInterval != MetadataSyncIntervalDefault {
-		t.Fatalf("expected removed env overrides to be ignored, got error_backoff=%s metadata_interval=%s", cfg.RedisQueueErrorBackoff, cfg.MetadataSyncInterval)
+	if cfg.MetadataSyncInterval != MetadataSyncIntervalDefault {
+		t.Fatalf("expected removed env overrides to be ignored, got metadata_interval=%s", cfg.MetadataSyncInterval)
 	}
 }
 

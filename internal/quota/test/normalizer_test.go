@@ -29,11 +29,14 @@ func TestNormalizeClaudeQuotaRows(t *testing.T) {
 	if fiveHour.ResetAt != "2026-05-09T12:00:00Z" {
 		t.Fatalf("unexpected five_hour resetAt: %#v", fiveHour)
 	}
+	assertIntField(t, fiveHour.Window.Seconds, 18000, "five_hour window seconds")
 	weekly := findQuotaRow(t, rows, "seven_day")
 	assertQuotaText(t, weekly, "Weekly", "window", "")
 	assertFloatField(t, weekly.UsedPercent, 72, "seven_day usedPercent")
+	assertIntField(t, weekly.Window.Seconds, 604800, "seven_day window seconds")
 	sonnet := findQuotaRow(t, rows, "seven_day_sonnet")
 	assertQuotaText(t, sonnet, "7d Sonnet", "model", "")
+	assertIntField(t, sonnet.Window.Seconds, 604800, "seven_day_sonnet window seconds")
 	extra := findQuotaRow(t, rows, "extra_usage")
 	assertQuotaText(t, extra, "Extra Usage", "extra_usage", "")
 	assertFloatField(t, extra.Used, 250, "extra_usage used")
@@ -121,18 +124,63 @@ func TestNormalizeCodexPrimaryWindowUsesWindowSecondsForWeeklyLabel(t *testing.T
 	primary := findQuotaRow(t, rows, "rate_limit.primary_window")
 	assertQuotaText(t, primary, "Weekly", "window", "")
 	assertIntField(t, primary.Window.Seconds, 604800, "primary weekly window seconds")
+	if primary.ResetAfterSeconds != nil {
+		t.Fatalf("expected missing Codex reset_after_seconds to stay nil, got %#v", primary.ResetAfterSeconds)
+	}
 }
 
-func TestNormalizeCodexUnknownWindowDoesNotGuessFiveHourOrWeekly(t *testing.T) {
+func TestNormalizeCodexPrimaryWindowUsesWindowSecondsForMonthlyLabel(t *testing.T) {
 	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "codex", Result: quota.CodexResult{Usage: &quota.CodexUsagePayload{
 		RateLimit: &quota.CodexRateLimitInfo{
-			PrimaryWindow: &quota.CodexUsageWindow{UsedPercent: 10, LimitWindowSeconds: 3600},
+			PrimaryWindow: &quota.CodexUsageWindow{UsedPercent: 10, LimitWindowSeconds: 2592000},
 		},
+		CodeReviewRateLimit: &quota.CodexRateLimitInfo{
+			PrimaryWindow: &quota.CodexUsageWindow{UsedPercent: 25, LimitWindowSeconds: 2592000},
+		},
+		AdditionalRateLimits: []quota.CodexAdditionalRateLimit{{
+			LimitName: "codex-spark",
+			RateLimit: &quota.CodexRateLimitInfo{
+				PrimaryWindow: &quota.CodexUsageWindow{UsedPercent: 40, LimitWindowSeconds: 2592000},
+			},
+		}},
 	}}})
 
 	primary := findQuotaRow(t, rows, "rate_limit.primary_window")
-	assertQuotaText(t, primary, "Window", "window", "")
+	assertQuotaText(t, primary, "Monthly", "window", "")
+	assertIntField(t, primary.Window.Seconds, 2592000, "primary monthly window seconds")
+	codeReview := findQuotaRow(t, rows, "code_review_rate_limit.primary_window")
+	assertQuotaText(t, codeReview, "Code Review Monthly", "code_review", "")
+	additional := findQuotaRow(t, rows, "additional_rate_limits.codex-spark.primary_window")
+	assertQuotaText(t, additional, "codex-spark Monthly", "additional", "codex-spark")
+}
+
+func TestNormalizeCodexUnknownWindowKeepsRoleLabelWithoutGenericWindow(t *testing.T) {
+	rows := quota.NormalizeQuotaRows(quota.ProviderOutput{Provider: "codex", Result: quota.CodexResult{Usage: &quota.CodexUsagePayload{
+		RateLimit: &quota.CodexRateLimitInfo{
+			PrimaryWindow:   &quota.CodexUsageWindow{UsedPercent: 10, LimitWindowSeconds: 3600},
+			SecondaryWindow: &quota.CodexUsageWindow{UsedPercent: 20, LimitWindowSeconds: 7200},
+		},
+		CodeReviewRateLimit: &quota.CodexRateLimitInfo{
+			PrimaryWindow: &quota.CodexUsageWindow{UsedPercent: 30, LimitWindowSeconds: 3600},
+		},
+		AdditionalRateLimits: []quota.CodexAdditionalRateLimit{{
+			LimitName: "GPT-5.3-Codex-Spark",
+			RateLimit: &quota.CodexRateLimitInfo{
+				SecondaryWindow: &quota.CodexUsageWindow{UsedPercent: 40, LimitWindowSeconds: 7200},
+			},
+		}},
+	}}})
+
+	primary := findQuotaRow(t, rows, "rate_limit.primary_window")
+	assertQuotaText(t, primary, "Primary", "window", "")
 	assertIntField(t, primary.Window.Seconds, 3600, "primary unknown window seconds")
+	secondary := findQuotaRow(t, rows, "rate_limit.secondary_window")
+	assertQuotaText(t, secondary, "Secondary", "window", "")
+	assertIntField(t, secondary.Window.Seconds, 7200, "secondary unknown window seconds")
+	codeReview := findQuotaRow(t, rows, "code_review_rate_limit.primary_window")
+	assertQuotaText(t, codeReview, "Code Review Primary", "code_review", "")
+	additional := findQuotaRow(t, rows, "additional_rate_limits.GPT-5.3-Codex-Spark.secondary_window")
+	assertQuotaText(t, additional, "GPT-5.3-Codex-Spark Secondary", "additional", "GPT-5.3-Codex-Spark")
 }
 
 func TestNormalizeGeminiCLIQuotaRows(t *testing.T) {
@@ -160,6 +208,9 @@ func TestNormalizeGeminiCLIQuotaRows(t *testing.T) {
 	if bucket.ResetAt != "2026-05-09T12:00:00Z" {
 		t.Fatalf("unexpected bucket resetAt: %#v", bucket)
 	}
+	if bucket.Window != nil {
+		t.Fatalf("expected Gemini CLI bucket to avoid guessed window seconds, got %#v", bucket.Window)
+	}
 	currentCredits := findQuotaRow(t, rows, "code_assist.current_tier.GOOGLE_ONE_AI")
 	assertQuotaText(t, currentCredits, "Code Assist Credit", "credits", "GOOGLE_ONE_AI")
 	assertFloatField(t, currentCredits.Remaining, 10, "current credits remaining")
@@ -181,9 +232,11 @@ func TestNormalizeAntigravityQuotaRows(t *testing.T) {
 	assertQuotaText(t, pro, "Pro", "model", "pro")
 	assertFloatField(t, pro.Remaining, 12, "pro remaining")
 	assertFloatField(t, pro.RemainingFraction, 0.4, "pro remainingFraction")
+	assertIntField(t, pro.Window.Seconds, 18000, "pro window seconds")
 	flash := findQuotaRow(t, rows, "model.flash")
 	assertQuotaText(t, flash, "flash", "model", "flash")
 	assertFloatField(t, flash.Remaining, 32, "flash remaining")
+	assertIntField(t, flash.Window.Seconds, 18000, "flash window seconds")
 }
 
 func TestNormalizeKimiQuotaRows(t *testing.T) {
@@ -222,6 +275,7 @@ func TestNormalizeKimiQuotaRows(t *testing.T) {
 	if limit.Window.Unit != "day" {
 		t.Fatalf("unexpected limit window unit: %#v", limit.Window)
 	}
+	assertIntField(t, limit.Window.Seconds, 86400, "limit window seconds")
 	if limit.ResetAt != "2026-05-10T12:00:00Z" {
 		t.Fatalf("unexpected limit resetAt: %#v", limit)
 	}

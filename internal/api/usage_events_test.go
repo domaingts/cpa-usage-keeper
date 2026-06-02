@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"cpa-usage-keeper/internal/entities"
-	"cpa-usage-keeper/internal/repository/dto"
 	servicedto "cpa-usage-keeper/internal/service/dto"
 )
 
@@ -20,10 +19,6 @@ type usageEventsStub struct {
 	lastFilter         servicedto.UsageFilter
 	filterCalls        int
 	filterOptionCalls  int
-}
-
-func (s *usageEventsStub) GetUsageWithFilter(context.Context, servicedto.UsageFilter) (*dto.StatisticsSnapshot, error) {
-	return nil, nil
 }
 
 func (s *usageEventsStub) GetUsageOverview(context.Context, servicedto.UsageFilter) (*servicedto.UsageOverviewSnapshot, error) {
@@ -65,12 +60,16 @@ func TestUsageEventsReturnsFilteredRows(t *testing.T) {
 		ID:                  42,
 		Timestamp:           time.Date(2026, 4, 22, 11, 0, 0, 0, time.UTC),
 		Model:               "claude-sonnet",
+		ReasoningEffort:     "medium",
+		ExecutorType:        "responses",
+		Endpoint:            "POST /v1/responses",
 		AuthType:            "apikey",
 		Provider:            "OpenAI Mirror",
 		Source:              "sk-provider-key",
 		AuthIndex:           "2",
 		Failed:              false,
 		LatencyMS:           321,
+		TTFTMS:              usageEventInt64Ptr(45),
 		InputTokens:         10,
 		OutputTokens:        5,
 		ReasoningTokens:     2,
@@ -78,6 +77,9 @@ func TestUsageEventsReturnsFilteredRows(t *testing.T) {
 		CacheReadTokens:     3,
 		CacheCreationTokens: 4,
 		TotalTokens:         18,
+		CostUSD:             0.1234,
+		CostAvailable:       true,
+		PricingStyle:        "claude",
 	}}}
 	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "")
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/events?range=24h", nil)
@@ -113,6 +115,21 @@ func TestUsageEventsReturnsFilteredRows(t *testing.T) {
 	if !contains(body, `"cache_read_tokens":3`) || !contains(body, `"cache_creation_tokens":4`) {
 		t.Fatalf("expected cache token fields in response body: %s", body)
 	}
+	if !contains(body, `"reasoning_effort":"medium"`) {
+		t.Fatalf("expected reasoning effort in response body: %s", body)
+	}
+	if !contains(body, `"endpoint":"POST /v1/responses"`) {
+		t.Fatalf("expected endpoint in response body: %s", body)
+	}
+	if !contains(body, `"ttft_ms":45`) {
+		t.Fatalf("expected ttft_ms in response body: %s", body)
+	}
+	if !contains(body, `"executor_type":"responses"`) {
+		t.Fatalf("expected executor_type in response body: %s", body)
+	}
+	if !contains(body, `"cost_usd":0.1234`) || !contains(body, `"cost_available":true`) || !contains(body, `"pricing_style":"claude"`) {
+		t.Fatalf("expected backend cost fields in response body: %s", body)
+	}
 	if provider.filterCalls != 1 {
 		t.Fatalf("expected ListUsageEvents to be called once, got %d", provider.filterCalls)
 	}
@@ -124,112 +141,6 @@ func TestUsageEventsReturnsFilteredRows(t *testing.T) {
 	}
 	if provider.lastFilter.StartTime == nil || provider.lastFilter.EndTime == nil {
 		t.Fatalf("expected resolved time bounds in filter, got %+v", provider.lastFilter)
-	}
-}
-
-func TestUsageIdentityDisplayNameFormatsProviderNameAndPrefix(t *testing.T) {
-	identity := entities.UsageIdentity{
-		Name:     "Provider Name",
-		Prefix:   "Team Prefix",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Identity: "provider-auth-index",
-	}
-
-	if got := usageIdentityDisplayName(identity); got != "Provider Name(Team Prefix)" {
-		t.Fatalf("expected provider displayName to include name and prefix, got %q", got)
-	}
-}
-
-func TestUsageIdentityDisplayNameAddsProviderBaseURLQualifier(t *testing.T) {
-	withPrefix := entities.UsageIdentity{
-		Name:     "Provider Name",
-		Prefix:   "Team Prefix",
-		BaseURL:  "https://api.openai.com/v1/",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Identity: "provider-auth-index",
-	}
-	providerOnly := entities.UsageIdentity{
-		Name:     "codex",
-		BaseURL:  "https://chatgpt.com/backend-api/codex/",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Identity: "codex-auth-index",
-	}
-
-	if got := usageIdentityDisplayName(withPrefix); got != "Provider Name(Team Prefix @ api.openai.com/v1)" {
-		t.Fatalf("expected base URL to be an extra display qualifier, got %q", got)
-	}
-	if got := usageIdentityDisplayName(providerOnly); got != "codex(chatgpt.com/backend-api/codex)" {
-		t.Fatalf("expected provider displayName to include base URL qualifier, got %q", got)
-	}
-}
-
-func TestUsageIdentityDisplayNameKeepsOpenAICompatibilityName(t *testing.T) {
-	identity := entities.UsageIdentity{
-		Name:     "OpenRouter",
-		Prefix:   "openrouter",
-		BaseURL:  "https://openrouter.ai/api/v1",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Type:     "openai",
-		Provider: "OpenRouter",
-		Identity: "openrouter-auth-index",
-	}
-
-	if got := usageIdentityDisplayName(identity); got != "OpenRouter" {
-		t.Fatalf("expected openai compatibility displayName to keep name without qualifiers, got %q", got)
-	}
-}
-
-func TestUsageIdentityDisplayNameFallsBackWhenOpenAICompatibilityNameIsMissing(t *testing.T) {
-	identity := entities.UsageIdentity{
-		Prefix:   "openrouter",
-		BaseURL:  "https://openrouter.ai/api/v1",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Type:     "openai",
-		Provider: "openai",
-		Identity: "openrouter-auth-index",
-	}
-
-	if got := usageIdentityDisplayName(identity); got != "openrouter(openrouter.ai/api/v1)" {
-		t.Fatalf("expected unnamed openai compatibility displayName to fall back to provider qualifier rules, got %q", got)
-	}
-}
-
-func TestUsageIdentityDisplayNameUsesProviderWhenAuthFileNameIsMissing(t *testing.T) {
-	identity := entities.UsageIdentity{
-		AuthType: entities.UsageIdentityAuthTypeAuthFile,
-		Provider: "Claude",
-	}
-
-	if got := usageIdentityDisplayName(identity); got != "Claude" {
-		t.Fatalf("expected auth file displayName to fall back to provider, got %q", got)
-	}
-}
-
-func TestUsageIdentityDisplayNameFallsBackWhenProviderNameOrPrefixIsMissing(t *testing.T) {
-	prefixOnly := entities.UsageIdentity{
-		Prefix:   "Team Prefix",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Identity: "provider-auth-index",
-	}
-	nameOnly := entities.UsageIdentity{
-		Name:     "Provider Name",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Identity: "provider-auth-index",
-	}
-	providerOnly := entities.UsageIdentity{
-		Provider: "OpenAI",
-		AuthType: entities.UsageIdentityAuthTypeAIProvider,
-		Identity: "provider-auth-index",
-	}
-
-	if got := usageIdentityDisplayName(prefixOnly); got != "Team Prefix" {
-		t.Fatalf("expected prefix-only provider displayName, got %q", got)
-	}
-	if got := usageIdentityDisplayName(nameOnly); got != "Provider Name" {
-		t.Fatalf("expected name-only provider displayName, got %q", got)
-	}
-	if got := usageIdentityDisplayName(providerOnly); got != "OpenAI" {
-		t.Fatalf("expected provider-only displayName, got %q", got)
 	}
 }
 
@@ -260,6 +171,98 @@ func TestUsageEventsResponseDoesNotExposeSourceKey(t *testing.T) {
 	}
 	if contains(body, `"source_key"`) {
 		t.Fatalf("expected source_key to be removed from usage event response, got %s", body)
+	}
+}
+
+func TestUsageEventsResolvesCPAAPIKeyAliasFromGroupKey(t *testing.T) {
+	provider := &usageEventsStub{events: []servicedto.UsageEventRecord{{
+		ID:          49,
+		Timestamp:   time.Date(2026, 4, 22, 11, 0, 0, 0, time.UTC),
+		APIGroupKey: "sk-alpha123456",
+		Model:       "claude-sonnet",
+		AuthType:    "apikey",
+		Provider:    "Fallback Provider",
+	}}}
+	keyProvider := &authCPAAPIKeyStub{row: entities.CPAAPIKey{
+		ID:         7,
+		APIKey:     "sk-alpha123456",
+		DisplayKey: "sk-*********123456",
+		KeyAlias:   "Production Key",
+	}}
+	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "", OptionalProviders{CPAAPIKeys: keyProvider})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/events?range=24h", nil)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", resp.Code, body)
+	}
+	if !contains(body, `"api_key":"Production Key"`) {
+		t.Fatalf("expected API key alias in response body: %s", body)
+	}
+	if contains(body, `sk-alpha123456`) || contains(body, `sk-*********123456`) {
+		t.Fatalf("expected raw and masked key to be hidden when alias exists, got %s", body)
+	}
+}
+
+func TestUsageEventsFallsBackToMaskedCPAAPIKeyFromGroupKey(t *testing.T) {
+	provider := &usageEventsStub{events: []servicedto.UsageEventRecord{{
+		ID:          50,
+		Timestamp:   time.Date(2026, 4, 22, 11, 0, 0, 0, time.UTC),
+		APIGroupKey: "sk-beta654321",
+		Model:       "claude-sonnet",
+		AuthType:    "apikey",
+		Provider:    "Fallback Provider",
+	}}}
+	keyProvider := &authCPAAPIKeyStub{row: entities.CPAAPIKey{
+		ID:         8,
+		APIKey:     "sk-beta654321",
+		DisplayKey: "sk-*********654321",
+	}}
+	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "", OptionalProviders{CPAAPIKeys: keyProvider})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/events?range=24h", nil)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", resp.Code, body)
+	}
+	if !contains(body, `"api_key":"sk-*********654321"`) {
+		t.Fatalf("expected masked API key in response body: %s", body)
+	}
+	if contains(body, `sk-beta654321`) {
+		t.Fatalf("expected raw API key to stay hidden, got %s", body)
+	}
+}
+
+func TestUsageEventsFallsBackToCanonicalMaskedAPIKeyWhenGroupKeyIsUnmatched(t *testing.T) {
+	provider := &usageEventsStub{events: []servicedto.UsageEventRecord{{
+		ID:          51,
+		Timestamp:   time.Date(2026, 4, 22, 11, 0, 0, 0, time.UTC),
+		APIGroupKey: "sk-BabcdefghijklmnopqrstuvwxyzmaWyTA",
+		Model:       "claude-sonnet",
+		AuthType:    "apikey",
+		Provider:    "Fallback Provider",
+	}}}
+	router := NewRouter(nil, nil, provider, nil, AuthConfig{}, nil, "", OptionalProviders{})
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/usage/events?range=24h", nil)
+	resp := httptest.NewRecorder()
+
+	router.ServeHTTP(resp, req)
+
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", resp.Code, body)
+	}
+	if !contains(body, `"api_key":"sk-*********maWyTA"`) {
+		t.Fatalf("expected canonical masked API key in response body: %s", body)
+	}
+	if contains(body, `sk-BabcdefghijklmnopqrstuvwxyzmaWyTA`) || contains(body, `sk-B***************************WyTA`) {
+		t.Fatalf("expected raw and variable-length masked keys to stay hidden, got %s", body)
 	}
 }
 
@@ -545,4 +548,8 @@ func TestUsageEventSourceFilterOptionsReturnsIdentitySources(t *testing.T) {
 	if contains(body, `Deleted Source`) || contains(body, `Deleted Provider`) || contains(body, `authidx-deleted`) {
 		t.Fatalf("expected deleted source filter options to be omitted, got %s", body)
 	}
+}
+
+func usageEventInt64Ptr(value int64) *int64 {
+	return &value
 }

@@ -2,10 +2,11 @@ package api
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
-	"cpa-usage-keeper/internal/redact"
+	"cpa-usage-keeper/internal/helper"
 	"cpa-usage-keeper/internal/service"
 	servicedto "cpa-usage-keeper/internal/service/dto"
 	"cpa-usage-keeper/internal/timeutil"
@@ -13,14 +14,16 @@ import (
 )
 
 type analysisResponse struct {
-	Granularity       string                    `json:"granularity"`
-	Timezone          string                    `json:"timezone"`
-	RangeStart        *time.Time                `json:"range_start,omitempty"`
-	RangeEnd          *time.Time                `json:"range_end,omitempty"`
-	TokenUsage        []analysisTokenUsage      `json:"token_usage"`
-	APIKeyComposition []analysisCompositionItem `json:"api_key_composition"`
-	ModelComposition  []analysisCompositionItem `json:"model_composition"`
-	Heatmap           analysisHeatmap           `json:"heatmap"`
+	Granularity           string                    `json:"granularity"`
+	Timezone              string                    `json:"timezone"`
+	RangeStart            *time.Time                `json:"range_start,omitempty"`
+	RangeEnd              *time.Time                `json:"range_end,omitempty"`
+	TokenUsage            []analysisTokenUsage      `json:"token_usage"`
+	APIKeyComposition     []analysisCompositionItem `json:"api_key_composition"`
+	ModelComposition      []analysisCompositionItem `json:"model_composition"`
+	AuthFilesComposition  []analysisCompositionItem `json:"auth_files_composition"`
+	AIProviderComposition []analysisCompositionItem `json:"ai_provider_composition"`
+	Heatmap               analysisHeatmap           `json:"heatmap"`
 }
 
 type analysisTokenUsage struct {
@@ -89,12 +92,14 @@ func registerUsageAnalysisRoute(router gin.IRoutes, usageProvider service.UsageP
 
 func emptyAnalysisResponse() analysisResponse {
 	return analysisResponse{
-		Granularity:       string(servicedto.AnalysisGranularityHourly),
-		Timezone:          time.Local.String(),
-		TokenUsage:        []analysisTokenUsage{},
-		APIKeyComposition: []analysisCompositionItem{},
-		ModelComposition:  []analysisCompositionItem{},
-		Heatmap:           analysisHeatmap{APIKeys: []string{}, Models: []string{}, Cells: []analysisHeatmapCell{}},
+		Granularity:           string(servicedto.AnalysisGranularityHourly),
+		Timezone:              time.Local.String(),
+		TokenUsage:            []analysisTokenUsage{},
+		APIKeyComposition:     []analysisCompositionItem{},
+		ModelComposition:      []analysisCompositionItem{},
+		AuthFilesComposition:  []analysisCompositionItem{},
+		AIProviderComposition: []analysisCompositionItem{},
+		Heatmap:               analysisHeatmap{APIKeys: []string{}, Models: []string{}, Cells: []analysisHeatmapCell{}},
 	}
 }
 
@@ -109,7 +114,7 @@ func loadCPAAPIKeyInfos(c *gin.Context, provider service.CPAAPIKeyProvider) (map
 	}
 	infos := make(map[string]analysisAPIKeyInfo, len(rows))
 	for _, row := range rows {
-		infos[row.APIKey] = analysisAPIKeyInfo{ID: row.ID, Label: cpaAPIKeyDisplayLabel(row)}
+		infos[row.APIKey] = analysisAPIKeyInfo{ID: row.ID, Label: helper.CPAAPIKeyDisplayName(row)}
 	}
 	return infos, nil
 }
@@ -132,15 +137,19 @@ func buildAnalysisPayload(snapshot *servicedto.AnalysisSnapshot, apiKeyInfos map
 	}
 	apiComposition := buildAnalysisCompositionPayload(snapshot.APIKeyComposition, apiKeyInfos)
 	modelComposition := buildAnalysisCompositionPayload(snapshot.ModelComposition, nil)
+	authFilesComposition := buildAnalysisCompositionPayload(snapshot.AuthFilesComposition, nil)
+	aiProviderComposition := buildAnalysisCompositionPayload(snapshot.AIProviderComposition, nil)
 	return analysisResponse{
-		Granularity:       string(snapshot.Granularity),
-		Timezone:          time.Local.String(),
-		RangeStart:        snapshot.RangeStart,
-		RangeEnd:          snapshot.RangeEnd,
-		TokenUsage:        tokenUsage,
-		APIKeyComposition: apiComposition,
-		ModelComposition:  modelComposition,
-		Heatmap:           buildAnalysisHeatmapPayload(snapshot.Heatmap, apiKeyInfos),
+		Granularity:           string(snapshot.Granularity),
+		Timezone:              time.Local.String(),
+		RangeStart:            snapshot.RangeStart,
+		RangeEnd:              snapshot.RangeEnd,
+		TokenUsage:            tokenUsage,
+		APIKeyComposition:     apiComposition,
+		ModelComposition:      modelComposition,
+		AuthFilesComposition:  authFilesComposition,
+		AIProviderComposition: aiProviderComposition,
+		Heatmap:               buildAnalysisHeatmapPayload(snapshot.Heatmap, apiKeyInfos),
 	}
 }
 
@@ -151,10 +160,13 @@ func buildAnalysisCompositionPayload(items []servicedto.AnalysisCompositionItem,
 	}
 	payload := make([]analysisCompositionItem, 0, len(items))
 	for _, item := range items {
-		key := analysisAPIKeyResponseKey(item.Key, apiKeyInfos)
+		key := helper.RedactSensitiveValue(item.Key)
 		label := item.Key
 		if apiKeyInfos != nil {
+			key = analysisAPIKeyResponseKey(item.Key, apiKeyInfos)
 			label = analysisAPIKeyLabel(item.Key, apiKeyInfos)
+		} else if item.Label != "" {
+			label = item.Label
 		}
 		percent := 0.0
 		if total > 0 {
@@ -169,36 +181,30 @@ func analysisAPIKeyResponseKey(apiKey string, apiKeyInfos map[string]analysisAPI
 	if info, ok := apiKeyInfos[apiKey]; ok && info.ID > 0 {
 		return strconv.FormatInt(info.ID, 10)
 	}
-	return redact.APIKeyDisplayName(apiKey)
+	return helper.RedactSensitiveValue(apiKey)
 }
 
 func analysisAPIKeyLabel(apiKey string, apiKeyInfos map[string]analysisAPIKeyInfo) string {
 	if info, ok := apiKeyInfos[apiKey]; ok && info.Label != "" {
 		return info.Label
 	}
-	return redact.APIKeyDisplayName(apiKey)
+	return helper.RedactSensitiveValue(apiKey)
 }
 
 func buildAnalysisHeatmapPayload(cells []servicedto.AnalysisHeatmapCell, apiKeyInfos map[string]analysisAPIKeyInfo) analysisHeatmap {
-	apiSeen := map[string]struct{}{}
-	modelSeen := map[string]struct{}{}
-	apiKeys := make([]string, 0)
-	models := make([]string, 0)
+	apiRequests := map[string]int64{}
+	modelRequests := map[string]int64{}
 	maxTokens := int64(0)
 	for _, cell := range cells {
 		apiKey := analysisAPIKeyLabel(cell.APIKey, apiKeyInfos)
-		if _, ok := apiSeen[apiKey]; !ok {
-			apiSeen[apiKey] = struct{}{}
-			apiKeys = append(apiKeys, apiKey)
-		}
-		if _, ok := modelSeen[cell.Model]; !ok {
-			modelSeen[cell.Model] = struct{}{}
-			models = append(models, cell.Model)
-		}
+		apiRequests[apiKey] += cell.Requests
+		modelRequests[cell.Model] += cell.Requests
 		if cell.TotalTokens > maxTokens {
 			maxTokens = cell.TotalTokens
 		}
 	}
+	apiKeys := sortedHeatmapKeysByRequests(apiRequests)
+	models := sortedHeatmapKeysByRequests(modelRequests)
 	payloadCells := make([]analysisHeatmapCell, 0, len(cells))
 	for _, cell := range cells {
 		intensity := 0.0
@@ -214,4 +220,18 @@ func buildAnalysisHeatmapPayload(cells []servicedto.AnalysisHeatmapCell, apiKeyI
 		})
 	}
 	return analysisHeatmap{APIKeys: apiKeys, Models: models, Cells: payloadCells}
+}
+
+func sortedHeatmapKeysByRequests(requestsByKey map[string]int64) []string {
+	keys := make([]string, 0, len(requestsByKey))
+	for key := range requestsByKey {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if requestsByKey[keys[i]] == requestsByKey[keys[j]] {
+			return keys[i] < keys[j]
+		}
+		return requestsByKey[keys[i]] > requestsByKey[keys[j]]
+	})
+	return keys
 }

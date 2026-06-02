@@ -1,5 +1,14 @@
+export type AuthRole = 'admin' | 'api_key_viewer'
+
+export interface AuthSessionAPIKeySummary {
+  display_key: string
+  alias?: string
+}
+
 export interface AuthSessionResponse {
   authenticated: boolean
+  role?: AuthRole
+  api_key?: AuthSessionAPIKeySummary
 }
 
 export interface StatusResponse {
@@ -8,6 +17,7 @@ export interface StatusResponse {
   timezone: string
   version?: string
   updateCheckEnabled?: boolean
+  cpa_public_url?: string
   last_run_at?: string
   last_error?: string
   last_warning?: string
@@ -22,44 +32,7 @@ export interface UpdateCheckResponse {
   message: string
 }
 
-export interface UsageTokenStats {
-  input_tokens: number
-  output_tokens: number
-  reasoning_tokens: number
-  cached_tokens: number
-  total_tokens: number
-}
-
-export interface UsageDetail {
-  timestamp: string
-  latency_ms: number
-  source: string
-  source_raw?: string
-  source_display?: string
-  source_type?: string
-  auth_index: string
-  failed: boolean
-  tokens: UsageTokenStats
-}
-
-export interface UsageModelSnapshot {
-  total_requests: number
-  success_count: number
-  failure_count: number
-  total_tokens: number
-  details?: UsageDetail[]
-}
-
-export interface UsageApiSnapshot {
-  display_name?: string
-  total_requests: number
-  success_count: number
-  failure_count: number
-  total_tokens: number
-  models: Record<string, UsageModelSnapshot>
-}
-
-export interface UsageSnapshot {
+export interface UsageOverviewUsageSnapshot {
   total_requests: number
   success_count: number
   failure_count: number
@@ -68,7 +41,6 @@ export interface UsageSnapshot {
   requests_by_hour: Record<string, number>
   tokens_by_day: Record<string, number>
   tokens_by_hour: Record<string, number>
-  apis: Record<string, UsageApiSnapshot>
 }
 
 export interface UsageOverviewSummary {
@@ -117,7 +89,7 @@ export interface UsageOverviewServiceHealth {
 }
 
 export interface UsageOverviewResponse {
-  usage: UsageSnapshot
+  usage: UsageOverviewUsageSnapshot
   summary?: UsageOverviewSummary
   series?: UsageOverviewSeries
   hourly_series?: UsageOverviewSeries
@@ -141,7 +113,11 @@ export interface UsageEventTokens {
 export interface UsageEvent {
   id?: string
   timestamp: string
+  api_key?: string
   model: string
+  reasoning_effort?: string
+  executor_type?: string
+  endpoint?: string
   source: string
   source_raw?: string
   source_type?: string
@@ -149,7 +125,11 @@ export interface UsageEvent {
   isDelete?: boolean
   failed: boolean
   latency_ms: number
+  ttft_ms?: number
   tokens: UsageEventTokens
+  cost_usd?: number
+  cost_available?: boolean
+  pricing_style?: PricingStyle
 }
 
 export interface UsageSourceFilterOption {
@@ -185,6 +165,10 @@ export interface UsageIdentity {
   identity: string
   type: string
   provider: string
+  prefix: string
+  priority?: number
+  disabled: boolean
+  note?: string
   plan_type?: string
   active_start?: string
   active_until?: string
@@ -210,12 +194,18 @@ export interface UsageIdentitiesResponse {
   identities: UsageIdentity[]
 }
 
+export interface UsageIdentityTypeCount {
+  type: string
+  count: number
+}
+
 export interface UsageIdentitiesPageResponse {
   identities: UsageIdentity[]
   total_count: number
   page: number
   page_size: number
   total_pages: number
+  type_counts?: UsageIdentityTypeCount[]
 }
 
 export interface UsageQuotaWindow {
@@ -240,6 +230,8 @@ export interface UsageQuotaRow {
   window?: UsageQuotaWindow
   resetAt?: string
   resetAfterSeconds?: number
+  window_usage_tokens?: number
+  window_usage_cost?: number
 }
 
 export interface UsageQuotaCheckResponse {
@@ -247,32 +239,41 @@ export interface UsageQuotaCheckResponse {
   quota: UsageQuotaRow[]
 }
 
+export interface UsageQuotaCacheItem {
+  auth_index: string
+  status: 'completed' | 'failed'
+  quota?: UsageQuotaCheckResponse
+  error?: string
+  http_status_code?: number
+  expires_at?: string
+  refreshed_at?: string
+}
+
 export interface UsageQuotaCacheResponse {
-  items: UsageQuotaCheckResponse[]
+  items: UsageQuotaCacheItem[]
 }
 
 export interface UsageQuotaRefreshTaskResponse {
-  taskId: string
   authIndex: string
   status: 'queued' | 'running' | 'completed' | 'failed'
   quota?: UsageQuotaCheckResponse
   error?: string
-  cachedAt?: string
+  http_status_code?: number
+  refreshed_at?: string
   expiresAt?: string
 }
 
-export interface UsageQuotaRefreshTaskID {
+export interface UsageQuotaRefreshTaskRef {
   authIndex: string
-  taskId: string
 }
 
 export interface UsageQuotaRefreshRejectedAuthIndex {
   authIndex: string
-  error: 'not_found' | 'not_auth_file' | 'unsupported' | 'duplicate' | 'invalid'
+  error: 'not_found' | 'not_auth_file' | 'unsupported' | 'duplicate' | 'duplicate_request' | 'invalid'
 }
 
 export interface UsageQuotaRefreshResponse {
-  tasks: UsageQuotaRefreshTaskID[]
+  tasks: UsageQuotaRefreshTaskRef[]
   rejected: UsageQuotaRefreshRejectedAuthIndex[]
   accepted: number
   skipped: number
@@ -319,6 +320,8 @@ export interface AnalysisResponse {
   token_usage: AnalysisTokenUsageBucket[]
   api_key_composition: AnalysisCompositionItem[]
   model_composition: AnalysisCompositionItem[]
+  auth_files_composition: AnalysisCompositionItem[]
+  ai_provider_composition: AnalysisCompositionItem[]
   heatmap: AnalysisHeatmapPayload
 }
 
@@ -343,11 +346,23 @@ export interface CpaApiKeyOptionsResponse {
   options: CpaApiKeyOption[]
 }
 
+export type PricingStyle = 'openai' | 'claude'
+
+export interface ModelPrice {
+  style: PricingStyle
+  prompt: number
+  completion: number
+  cache: number
+  cacheCreation: number
+}
+
 export interface PricingEntry {
   model: string
+  pricing_style: PricingStyle
   prompt_price_per_1m: number
   completion_price_per_1m: number
   cache_price_per_1m: number
+  cache_creation_price_per_1m: number
 }
 
 export interface UsedModelsResponse {
@@ -358,93 +373,12 @@ export interface PricingResponse {
   pricing: PricingEntry[]
 }
 
-export type UsageTimeRange = '4h' | '8h' | '12h' | '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'custom'
+export type KeyOverviewTimeRange = '4h' | '8h' | '12h' | '24h' | 'today' | 'yesterday' | '7d' | '30d'
+
+export type UsageTimeRange = KeyOverviewTimeRange | 'custom'
 
 export interface UsageFilterWindow {
   startMs?: number
   endMs?: number
   windowMinutes?: number
-}
-
-export type UsageSeriesDimension = 'all' | 'api' | 'model'
-
-export interface SummaryCardValue {
-  key: string
-  label: string
-  value: string
-  hint?: string
-  accent: string
-}
-
-export interface ApiSummaryItem {
-  apiName: string
-  totalRequests: number
-  successCount: number
-  failureCount: number
-  totalTokens: number
-  modelCount: number
-  totalCost: number
-  models: Array<{
-    modelName: string
-    totalRequests: number
-    successCount: number
-    failureCount: number
-    totalTokens: number
-    totalCost: number
-  }>
-}
-
-export interface ModelSummaryItem {
-  apiName: string
-  modelName: string
-  totalRequests: number
-  successCount: number
-  failureCount: number
-  totalTokens: number
-  averageLatencyMs: number
-  totalLatencyMs: number
-  successRate: number
-  totalCost: number
-}
-
-export interface EventRow {
-  timestamp: string
-  apiName: string
-  modelName: string
-  source: string
-  authIndex: string
-  failed: boolean
-  latencyMs: number
-  inputTokens: number
-  outputTokens: number
-  reasoningTokens: number
-  cachedTokens: number
-  totalTokens: number
-}
-
-export interface TrendPoint {
-  label: string
-  value: number
-}
-
-export interface TrendSeries {
-  key: string
-  label: string
-  color: string
-  data: TrendPoint[]
-}
-
-export interface TokenBreakdown {
-  inputTokens: number
-  outputTokens: number
-  reasoningTokens: number
-  cachedTokens: number
-}
-
-export interface RateStats {
-  rpm: number
-  tpm: number
-  requestCount: number
-  tokenCount: number
-  windowMinutes: number
 }

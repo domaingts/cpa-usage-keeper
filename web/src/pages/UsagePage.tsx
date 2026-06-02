@@ -14,7 +14,7 @@ import {
   Legend,
   Filler
 } from 'chart.js';
-import { ApiError, fetchAnalysis, fetchCpaApiKeyOptions, fetchCpaApiKeys, fetchStatus, fetchUpdateCheck, fetchUsageEventModelFilterOptions, fetchUsageEventSourceFilterOptions, fetchUsageEvents, updateCpaApiKeyAlias } from '@/lib/api';
+import { ApiError, fetchAnalysis, fetchCpaApiKeyOptions, fetchCpaApiKeys, fetchStatus, fetchUpdateCheck, fetchUsageEventModelFilterOptions, fetchUsageEventSourceFilterOptions, fetchUsageEvents, logout, markStatusActive, updateCpaApiKeyAlias } from '@/lib/api';
 import type { AnalysisResponse, CpaApiKeyOption, CpaApiKeySettingsItem, StatusResponse, UsageEvent, UsageSourceFilterOption } from '@/lib/types';
 import { LoadingSpinner } from '@/components/ui/LoadingSpinner';
 import { LanguageSwitcher } from '@/components/ui/LanguageSwitcher';
@@ -32,6 +32,7 @@ import {
   PriceSettingsCard,
   AuthFileCredentialsSection,
   AiProviderCredentialsSection,
+  CredentialProviderFilterBar,
   RequestEventsDetailsCard,
   TokenBreakdownChart,
   CostTrendChart,
@@ -44,13 +45,14 @@ import {
 } from '@/components/usage';
 import { buildUsageRangeQuery } from '@/utils/usage/rangeQuery';
 import {
-  getModelNamesFromUsage,
+  getOverviewModelNames,
   resolveUsageFilterWindow,
   sanitizeChartLines,
   type UsageFilterWindow,
   type UsageTimeRange
 } from '@/utils/usage';
 import type { Theme } from '@/types';
+import { BrandLink } from '@/components/BrandLink';
 import styles from './UsagePage.module.scss';
 
 ChartJS.register(
@@ -98,14 +100,15 @@ const THEME_OPTIONS: ReadonlyArray<{ value: Theme; labelKey: string }> = [
   { value: 'dark', labelKey: 'usage_stats.theme_dark' },
   { value: 'auto', labelKey: 'usage_stats.theme_auto' }
 ];
-const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'events', 'credentials', 'settings'] as const;
+const USAGE_TAB_OPTIONS = ['overview', 'analysis', 'events', 'auth-files', 'ai-provider', 'settings'] as const;
 type UsageTab = (typeof USAGE_TAB_OPTIONS)[number];
 type Translate = (key: string) => string;
 const USAGE_TAB_LABEL_KEYS: Record<UsageTab, string> = {
   overview: 'usage_stats.tab_overview',
   analysis: 'usage_stats.tab_analysis',
   events: 'usage_stats.tab_events',
-  credentials: 'usage_stats.tab_credentials',
+  'auth-files': 'usage_stats.tab_auth_files',
+  'ai-provider': 'usage_stats.tab_ai_provider',
   settings: 'usage_stats.tab_settings',
 };
 const DEFAULT_USAGE_TAB: UsageTab = 'overview';
@@ -114,29 +117,83 @@ const REQUEST_EVENTS_PAGE_SIZES = [20, 50, 100, 500, 1000] as const;
 const REQUEST_EVENTS_DEFAULT_PAGE_SIZE = 100;
 const ALL_REQUEST_EVENTS_FILTER = '__all__';
 const OVERVIEW_AUTO_REFRESH_INTERVAL_MS = 10_000;
+export const STATUS_ACTIVE_HEARTBEAT_INTERVAL_MS = 30_000;
+const CPA_MANAGEMENT_PAGE = 'management.html';
+const ABSOLUTE_HTTP_URL_PATTERN = /^https?:\/\//i;
+const EXPLICIT_URL_SCHEME_PATTERN = /^[a-z][a-z\d+.-]*:/i;
+const BARE_HOST_WITH_PORT_PATTERN = /^[a-z0-9.-]+:\d+(?:[/?#]|$)/i;
 
-export const shouldShowRangeControls = (tab: UsageTab) => tab !== 'settings' && tab !== 'credentials';
+export const getCredentialSectionVisibility = (tab: UsageTab) => ({
+  enabled: tab === 'auth-files' || tab === 'ai-provider',
+  showAuthFiles: tab === 'auth-files',
+  showAiProvider: tab === 'ai-provider',
+});
+
+export const shouldShowRangeControls = (tab: UsageTab) => tab !== 'settings' && !getCredentialSectionVisibility(tab).enabled;
 
 export const shouldShowApiKeyFilter = (tab: UsageTab) => shouldShowRangeControls(tab);
 
 export const shouldShowUpdateCheckButton = (status: Pick<StatusResponse, 'updateCheckEnabled'> | null) => status?.updateCheckEnabled === true;
+
+export const isUsagePageVisible = (documentRef?: Pick<Document, 'visibilityState'>) => {
+  const targetDocument = documentRef ?? (typeof document === 'undefined' ? undefined : document);
+  return !targetDocument || targetDocument.visibilityState !== 'hidden';
+};
+
+const getBrowserOrigin = () => (typeof window === 'undefined' ? '' : window.location.origin);
+
+const getProtocolForBareHost = (currentOrigin: string) => {
+  try {
+    return new URL(currentOrigin).protocol;
+  } catch {
+    return typeof window === 'undefined' ? 'https:' : window.location.protocol;
+  }
+};
+
+const prepareCPAPublicURL = (rawURL: string, currentOrigin: string) => {
+  const trimmed = rawURL.trim();
+  if (!trimmed) return '';
+  if (ABSOLUTE_HTTP_URL_PATTERN.test(trimmed) || trimmed.startsWith('//') || trimmed.startsWith('/')) {
+    return trimmed;
+  }
+  if (EXPLICIT_URL_SCHEME_PATTERN.test(trimmed) && !BARE_HOST_WITH_PORT_PATTERN.test(trimmed)) {
+    return '';
+  }
+  return `${getProtocolForBareHost(currentOrigin)}//${trimmed}`;
+};
+
+export const getBackToCPALinkURL = (
+  status: Pick<StatusResponse, 'cpa_public_url'> | null,
+  currentOrigin = getBrowserOrigin(),
+) => {
+  const preparedURL = prepareCPAPublicURL(status?.cpa_public_url ?? currentOrigin, currentOrigin);
+  if (!preparedURL) return '';
+
+  try {
+    const parsedURL = currentOrigin ? new URL(preparedURL, currentOrigin) : new URL(preparedURL);
+    if (!parsedURL.pathname.endsWith(`/${CPA_MANAGEMENT_PAGE}`)) {
+      const basePath = parsedURL.pathname.replace(/\/+$/, '');
+      parsedURL.pathname = basePath ? `${basePath}/${CPA_MANAGEMENT_PAGE}` : `/${CPA_MANAGEMENT_PAGE}`;
+      parsedURL.search = '';
+      parsedURL.hash = '';
+    }
+    return parsedURL.toString();
+  } catch {
+    return '';
+  }
+};
 
 export const getUpdateCheckToastDuration = (kind: 'success' | 'info' | 'error') => (kind === 'error' ? 6_000 : 4_000);
 
 export const shouldAutoRefreshUsageTab = ({
   activeTab,
   eventsPage,
-  authFilePage,
-  aiProviderPage,
 }: {
   activeTab: UsageTab;
   eventsPage: number;
-  authFilePage: number;
-  aiProviderPage: number;
 }) => {
   if (activeTab === 'overview') return true;
   if (activeTab === 'events') return eventsPage === 1;
-  if (activeTab === 'credentials') return authFilePage === 1 && aiProviderPage === 1;
   return false;
 };
 
@@ -161,6 +218,24 @@ type OverviewAutoRefreshOptions = {
   enabled: boolean;
   refreshOverview: () => void | Promise<void>;
   documentRef?: OverviewAutoRefreshDocument;
+  intervalMs?: number;
+};
+
+type StatusActiveHeartbeatDocument = Pick<Document, 'visibilityState' | 'addEventListener' | 'removeEventListener'>;
+
+type StatusActiveHeartbeatTimerTarget = {
+  setInterval: (handler: () => void, timeout: number) => number;
+  clearInterval: (handle: number) => void;
+};
+
+type StatusActiveHeartbeatOptions = {
+  loadStatus: (signal: AbortSignal) => Promise<StatusResponse>;
+  markActive: (signal: AbortSignal) => Promise<void>;
+  setStatus: (status: StatusResponse) => void;
+  setStatusError: (error: string) => void;
+  onAuthRequired?: () => void;
+  documentRef?: StatusActiveHeartbeatDocument;
+  timerTarget?: StatusActiveHeartbeatTimerTarget;
   intervalMs?: number;
 };
 
@@ -220,6 +295,80 @@ export const scheduleOverviewAutoRefresh = ({
   return () => {
     stopTimer();
     targetDocument.removeEventListener('visibilitychange', handleVisibilityChange);
+  };
+};
+
+export const scheduleStatusActiveHeartbeat = ({
+  loadStatus,
+  markActive,
+  setStatus,
+  setStatusError,
+  onAuthRequired,
+  documentRef,
+  timerTarget,
+  intervalMs = STATUS_ACTIVE_HEARTBEAT_INTERVAL_MS,
+}: StatusActiveHeartbeatOptions) => {
+  const targetDocument = documentRef ?? (typeof document === 'undefined' ? undefined : document);
+  const timers = timerTarget ?? (typeof window === 'undefined' ? undefined : {
+    setInterval: window.setInterval.bind(window),
+    clearInterval: window.clearInterval.bind(window),
+  });
+  if (!timers) {
+    return () => undefined;
+  }
+
+  let controller: AbortController | null = null;
+  let timer: number | null = null;
+  const isVisible = () => isUsagePageVisible(targetDocument);
+  const stopPolling = () => {
+    controller?.abort();
+    controller = null;
+    if (timer !== null) {
+      timers.clearInterval(timer);
+      timer = null;
+    }
+  };
+  const loadAndMarkActive = async () => {
+    controller?.abort();
+    const requestController = new AbortController();
+    controller = requestController;
+    try {
+      // status 成功后才发送 active 心跳，避免异常页面状态把后端误标记为活跃。
+      const status = await loadStatus(requestController.signal);
+      setStatus(status);
+      setStatusError(status.last_error || '');
+      await markActive(requestController.signal);
+    } catch (error) {
+      if (requestController.signal.aborted) return;
+      if (error instanceof ApiError && error.status === 401) {
+        onAuthRequired?.();
+      }
+    }
+  };
+  const startPolling = () => {
+    if (!isVisible()) {
+      stopPolling();
+      return;
+    }
+    void loadAndMarkActive();
+    timer = timers.setInterval(() => {
+      void loadAndMarkActive();
+    }, intervalMs);
+  };
+  const handleVisibilityChange = () => {
+    stopPolling();
+    startPolling();
+  };
+
+  startPolling();
+  if (targetDocument) {
+    targetDocument.addEventListener('visibilitychange', handleVisibilityChange);
+  }
+  return () => {
+    if (targetDocument) {
+      targetDocument.removeEventListener('visibilitychange', handleVisibilityChange);
+    }
+    stopPolling();
   };
 };
 
@@ -401,6 +550,13 @@ const loadTimeRange = (): UsageTimeRange => {
 const isUsageTab = (value: unknown): value is UsageTab =>
   typeof value === 'string' && USAGE_TAB_OPTIONS.includes(value as UsageTab);
 
+export const normalizeUsageTabValue = (value: unknown): UsageTab | null => {
+  if (value === 'credentials') {
+    return 'auth-files';
+  }
+  return isUsageTab(value) ? value : null;
+};
+
 export const getUsageTabOptions = (translate: Translate): Array<{ value: UsageTab; label: string }> =>
   USAGE_TAB_OPTIONS.map((value) => ({
     value,
@@ -433,9 +589,12 @@ const toTimestampMs = (value: string | undefined): number | undefined => {
   return Number.isFinite(timestamp) ? timestamp : undefined;
 };
 
-export const getOverviewChartEndMs = ({ timeRange, filterWindow, fallbackEndMs, resolvedRangeEndMs }: { timeRange: UsageTimeRange; filterWindow: UsageFilterWindow; fallbackEndMs: number; resolvedRangeEndMs?: number }) => {
-  if (isTodayTimeRange(timeRange) && filterWindow.startMs !== undefined) {
-    return filterWindow.startMs + 24 * 60 * 60 * 1000;
+export const getOverviewChartEndMs = ({ timeRange, filterWindow, fallbackEndMs, resolvedRangeStartMs, resolvedRangeEndMs }: { timeRange: UsageTimeRange; filterWindow: UsageFilterWindow; fallbackEndMs: number; resolvedRangeStartMs?: number; resolvedRangeEndMs?: number }) => {
+  if (isTodayTimeRange(timeRange)) {
+    const startMs = resolvedRangeStartMs ?? filterWindow.startMs;
+    if (startMs !== undefined) {
+      return startMs + 24 * 60 * 60 * 1000;
+    }
   }
   if (isYesterdayTimeRange(timeRange) && resolvedRangeEndMs !== undefined) {
     return Math.ceil((resolvedRangeEndMs + 1) / (60 * 60 * 1000)) * 60 * 60 * 1000;
@@ -450,7 +609,7 @@ const loadUsageTab = (): UsageTab => {
       return DEFAULT_USAGE_TAB;
     }
     const raw = localStorage.getItem(USAGE_TAB_STORAGE_KEY);
-    return isUsageTab(raw) ? raw : DEFAULT_USAGE_TAB;
+    return normalizeUsageTabValue(raw) ?? DEFAULT_USAGE_TAB;
   } catch {
     return DEFAULT_USAGE_TAB;
   }
@@ -471,6 +630,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   const [apiKeyOptions, setApiKeyOptions] = useState<CpaApiKeyOption[]>([]);
   const apiKeyOptionsRequestControllerRef = useRef<AbortController | null>(null);
   const isOverviewTab = activeTab === 'overview';
+  const credentialSectionVisibility = getCredentialSectionVisibility(activeTab);
 
   const {
     usage,
@@ -507,6 +667,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   const [updateCheckLoading, setUpdateCheckLoading] = useState(false);
   const [updateCheckNotice, setUpdateCheckNotice] = useState<{ kind: 'success' | 'info' | 'error'; message: string } | null>(null);
   const [hasNewVersion, setHasNewVersion] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
   const updateCheckNoticeTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const [customRangeError, setCustomRangeError] = useState('');
   const [customRangeHint, setCustomRangeHint] = useState('');
@@ -525,8 +686,10 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   const eventsRequestControllerRef = useRef<AbortController | null>(null);
   const eventsFilterOptionsRequestControllerRef = useRef<AbortController | null>(null);
   const [manualRefreshLoading, setManualRefreshLoading] = useState(false);
+  const [pageVisible, setPageVisible] = useState(isUsagePageVisible);
   const credentialsData = useCredentialsTabData({
-    enabled: activeTab === 'credentials',
+    enabledAuthFiles: credentialSectionVisibility.showAuthFiles && pageVisible,
+    enabledAiProviders: credentialSectionVisibility.showAiProvider && pageVisible,
     onAuthRequired,
   });
   const refreshCredentials = credentialsData.refresh;
@@ -545,6 +708,14 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     ],
     [apiKeyOptions, t],
   );
+  const credentialTypeCountsForProviderFilter = useMemo(() => {
+    if (credentialSectionVisibility.showAuthFiles) return credentialsData.authFileTypeCounts;
+    if (credentialSectionVisibility.showAiProvider) return credentialsData.aiProviderTypeCounts;
+    return [];
+  }, [credentialSectionVisibility.showAiProvider, credentialSectionVisibility.showAuthFiles, credentialsData.aiProviderTypeCounts, credentialsData.authFileTypeCounts]);
+  const activeCredentialProviderFilter = credentialSectionVisibility.showAiProvider ? credentialsData.aiProviderProviderFilter : credentialsData.authFileProviderFilter;
+  const setActiveCredentialProviderFilter = credentialSectionVisibility.showAiProvider ? credentialsData.setAiProviderProviderFilter : credentialsData.setAuthFileProviderFilter;
+  const activeCredentialProviderFilterScope = credentialSectionVisibility.showAiProvider ? 'ai-provider' : 'auth-files';
   const themeOptions = useMemo(
     () =>
       THEME_OPTIONS.map((option) => ({
@@ -558,6 +729,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     if (updateCheckNotice.kind === 'success') return styles.updateCheckToastSuccess;
     return styles.updateCheckToastInfo;
   })() : '';
+  const cpaManagementURL = useMemo(() => getBackToCPALinkURL(status), [status]);
 
   const resolvedRangeStartMs = toTimestampMs(usage?.range_start);
   const resolvedRangeEndMs = toTimestampMs(usage?.range_end);
@@ -724,6 +896,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     timeRange,
     filterWindow,
     fallbackEndMs: lastRefreshedAt?.getTime() ?? Date.now(),
+    resolvedRangeStartMs,
     resolvedRangeEndMs,
   });
   const includeFinalHourBucket = isTodayTimeRange(timeRange) || isYesterdayTimeRange(timeRange);
@@ -801,31 +974,27 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   }, [customTimeRange.end, customTimeRange.start, lastRefreshedAt, timeRange]);
 
   useEffect(() => {
-    let controller: AbortController | null = null;
-    const loadStatus = async () => {
-      controller?.abort();
-      const requestController = new AbortController();
-      controller = requestController;
-      try {
-        const status: StatusResponse = await fetchStatus(requestController.signal);
-        setStatus(status);
-        setStatusError(status.last_error || '');
-      } catch (error) {
-        if (requestController.signal.aborted) return;
-        if (error instanceof ApiError && error.status === 401) {
-          onAuthRequired?.();
-          return;
-        }
-      }
-    };
-    void loadStatus();
-    const timer = window.setInterval(() => {
-      void loadStatus();
-    }, 30_000);
+    // Credentials 列表、quota cache 和 task polling 都跟页面可见性绑定，隐藏页不保持续约或轮询。
+    const syncPageVisible = () => setPageVisible(isUsagePageVisible());
+    syncPageVisible();
+    if (typeof document === 'undefined') {
+      return undefined;
+    }
+    document.addEventListener('visibilitychange', syncPageVisible);
     return () => {
-      controller?.abort();
-      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', syncPageVisible);
     };
+  }, []);
+
+  useEffect(() => {
+    // 页面级心跳独立于 Credentials tab；调度函数内部负责可见性、abort 和 timer 清理。
+    return scheduleStatusActiveHeartbeat({
+      loadStatus: fetchStatus,
+      markActive: markStatusActive,
+      setStatus,
+      setStatusError,
+      onAuthRequired,
+    });
   }, [onAuthRequired]);
 
   useEffect(() => {
@@ -982,7 +1151,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       await Promise.all([loadEventFilterOptions(), loadEvents()]);
       return;
     }
-    if (activeTab === 'credentials') {
+    if (credentialSectionVisibility.enabled) {
       await refreshCredentials();
       return;
     }
@@ -995,25 +1164,23 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       return;
     }
     await loadUsage();
-  }, [activeTab, loadAnalysis, loadApiKeySettings, loadEventFilterOptions, loadEvents, loadPricing, loadUsage, refreshCredentials]);
+  }, [activeTab, credentialSectionVisibility.enabled, loadAnalysis, loadApiKeySettings, loadEventFilterOptions, loadEvents, loadPricing, loadUsage, refreshCredentials]);
 
   const refreshAutoRefreshTab = useCallback(async () => {
     if (activeTab === 'events') {
       await loadEvents();
       return;
     }
-    if (activeTab === 'credentials') {
+    if (credentialSectionVisibility.enabled) {
       await refreshCredentials();
       return;
     }
     await loadUsage();
-  }, [activeTab, loadEvents, loadUsage, refreshCredentials]);
+  }, [activeTab, credentialSectionVisibility.enabled, loadEvents, loadUsage, refreshCredentials]);
 
   const autoRefreshEnabled = shouldAutoRefreshUsageTab({
     activeTab,
     eventsPage,
-    authFilePage: credentialsData.authFilePage,
-    aiProviderPage: credentialsData.aiProviderPage,
   });
 
   const handleManualRefresh = useCallback(async () => {
@@ -1025,11 +1192,11 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
         onAuthRequired?.();
         return;
       }
-      setStatusError(error instanceof Error ? error.message : t('notification.refresh_failed'));
+      setStatusError(error instanceof Error ? error.message : 'REFRESH_FAILED');
     } finally {
       setManualRefreshLoading(false);
     }
-  }, [onAuthRequired, refreshActiveTab, t]);
+  }, [onAuthRequired, refreshActiveTab]);
 
   const showUpdateCheckNotice = useCallback((kind: 'success' | 'info' | 'error', message: string) => {
     if (updateCheckNoticeTimerRef.current !== null) {
@@ -1041,6 +1208,16 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       updateCheckNoticeTimerRef.current = null;
     }, getUpdateCheckToastDuration(kind));
   }, []);
+
+  const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
+    try {
+      await logout();
+    } finally {
+      onAuthRequired?.();
+      setLoggingOut(false);
+    }
+  }, [onAuthRequired]);
 
   const handleUpdateCheck = useCallback(async () => {
     setUpdateCheckLoading(true);
@@ -1156,6 +1333,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
     const parsed = new Date(status.last_run_at);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }, [status?.last_run_at]);
+  const displayStatusError = statusError === 'REFRESH_FAILED' ? t('notification.refresh_failed') : statusError;
   // 只有需要时间范围的 tab 才渲染 Range 控件，避免 Credentials/Pricing 产生空白占位。
   const showRangeControls = shouldShowRangeControls(activeTab);
   const {
@@ -1185,7 +1363,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
   });
 
   const overviewModelNames = useMemo(
-    () => getModelNamesFromUsage(usage?.usage ?? null),
+    () => getOverviewModelNames(usage),
     [usage]
   );
 
@@ -1206,7 +1384,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
       <div className={styles.pageFrame}>
         <header className={styles.topBar}>
           <div className={styles.brandBlock}>
-            <span className={styles.eyebrow}>CPA Usage Keeper</span>
+            <BrandLink className={styles.eyebrow} />
           </div>
           <div className={styles.topBarActions}>
             <LanguageSwitcher />
@@ -1251,6 +1429,16 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                 </button>
               </div>
             )}
+            <div className={styles.signOutSwitcher} role="group" aria-label={t('common.logout')}>
+              <button
+                type="button"
+                className={`${styles.signOutPill} ${styles.signOutPillActive}`.trim()}
+                onClick={() => void handleLogout()}
+                disabled={loggingOut}
+              >
+                <span className={styles.signOutPillInner}>{loggingOut ? t('common.loading') : t('common.logout')}</span>
+              </button>
+            </div>
           </div>
         </header>
 
@@ -1265,11 +1453,32 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
               </div>
             )}
 
-            {lastSyncAt && (
+            {(cpaManagementURL || lastSyncAt) && (
               <div className={styles.toolbarMetaRow}>
-                <span className={styles.lastRefreshed}>
-                  {t('usage_stats.last_updated')}: {lastSyncAt.toLocaleTimeString()}
-                </span>
+                {lastSyncAt && (
+                  <span className={styles.lastRefreshed}>
+                    {t('usage_stats.last_updated')}: {lastSyncAt.toLocaleTimeString()}
+                  </span>
+                )}
+                {cpaManagementURL && (
+                  <div className={styles.toolbarMetaRight}>
+                    <a
+                      className={styles.backToCpaLink}
+                      href={cpaManagementURL}
+                      target="_blank"
+                      rel="noreferrer"
+                      aria-label={t('usage_stats.back_to_cpa_aria')}
+                    >
+                      <span>{t('usage_stats.back_to_cpa')}</span>
+                      <span className={styles.backToCpaIcon} aria-hidden="true">
+                        <svg viewBox="0 0 16 16" focusable="false">
+                          <path d="M6 4h6v6" />
+                          <path d="M12 4 5 11" />
+                        </svg>
+                      </span>
+                    </a>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1347,52 +1556,62 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                     >
                       <label className={styles.customRangeField}>
                         <span className={styles.customRangeFieldLabel}>{t('usage_stats.custom_start')}</span>
-                        <input
-                          type="date"
-                          className={`input ${styles.customRangeInput}`}
-                          value={customTimeRange.start}
-                          min={customDateRangeBounds.min}
-                          max={customDateRangeBounds.max}
-                          disabled={!isCustomRange}
-                          onClick={handleCustomDateInputActivate}
-                          onFocus={handleCustomDateInputActivate}
-                          onKeyDown={handleCustomDateInputKeyDown}
-                          onPaste={(event) => event.preventDefault()}
-                          onChange={(event) => {
-                            const nextValue = event.target.value;
-                            if (!isCustomDateWithinBounds(nextValue, customDateRangeBounds)) return;
-                            setCustomTimeRange((current) => ({
-                              ...current,
-                              start: nextValue
-                            }));
-                          }}
-                          aria-label={t('usage_stats.custom_start')}
-                        />
+                        <span className={styles.customRangeInputShell}>
+                          <input
+                            type="date"
+                            className={`input ${styles.customRangeInput}`}
+                            value={customTimeRange.start}
+                            min={customDateRangeBounds.min}
+                            max={customDateRangeBounds.max}
+                            disabled={!isCustomRange}
+                            onClick={handleCustomDateInputActivate}
+                            onFocus={handleCustomDateInputActivate}
+                            onKeyDown={handleCustomDateInputKeyDown}
+                            onPaste={(event) => event.preventDefault()}
+                            onChange={(event) => {
+                              const nextValue = event.target.value;
+                              if (!isCustomDateWithinBounds(nextValue, customDateRangeBounds)) return;
+                              setCustomTimeRange((current) => ({
+                                ...current,
+                                start: nextValue
+                              }));
+                            }}
+                            aria-label={t('usage_stats.custom_start')}
+                          />
+                          <span className={styles.customRangeInputDisplay} aria-hidden="true">
+                            {customTimeRange.start || 'YYYY-MM-DD'}
+                          </span>
+                        </span>
                       </label>
                       <span className={styles.customRangeSeparator} aria-hidden="true">—</span>
                       <label className={styles.customRangeField}>
                         <span className={styles.customRangeFieldLabel}>{t('usage_stats.custom_end')}</span>
-                        <input
-                          type="date"
-                          className={`input ${styles.customRangeInput}`}
-                          value={customTimeRange.end}
-                          min={customDateRangeBounds.min}
-                          max={customDateRangeBounds.max}
-                          disabled={!isCustomRange}
-                          onClick={handleCustomDateInputActivate}
-                          onFocus={handleCustomDateInputActivate}
-                          onKeyDown={handleCustomDateInputKeyDown}
-                          onPaste={(event) => event.preventDefault()}
-                          onChange={(event) => {
-                            const nextValue = event.target.value;
-                            if (!isCustomDateWithinBounds(nextValue, customDateRangeBounds)) return;
-                            setCustomTimeRange((current) => ({
-                              ...current,
-                              end: nextValue
-                            }));
-                          }}
-                          aria-label={t('usage_stats.custom_end')}
-                        />
+                        <span className={styles.customRangeInputShell}>
+                          <input
+                            type="date"
+                            className={`input ${styles.customRangeInput}`}
+                            value={customTimeRange.end}
+                            min={customDateRangeBounds.min}
+                            max={customDateRangeBounds.max}
+                            disabled={!isCustomRange}
+                            onClick={handleCustomDateInputActivate}
+                            onFocus={handleCustomDateInputActivate}
+                            onKeyDown={handleCustomDateInputKeyDown}
+                            onPaste={(event) => event.preventDefault()}
+                            onChange={(event) => {
+                              const nextValue = event.target.value;
+                              if (!isCustomDateWithinBounds(nextValue, customDateRangeBounds)) return;
+                              setCustomTimeRange((current) => ({
+                                ...current,
+                                end: nextValue
+                              }));
+                            }}
+                            aria-label={t('usage_stats.custom_end')}
+                          />
+                          <span className={styles.customRangeInputDisplay} aria-hidden="true">
+                            {customTimeRange.end || 'YYYY-MM-DD'}
+                          </span>
+                        </span>
                       </label>
                     </div>
                   </div>
@@ -1435,7 +1654,7 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
             {activeTab === 'overview' && error && <div className={styles.errorBox}>{error === 'AUTH_REQUIRED' ? t('auth.session_expired') : error}</div>}
             {activeTab === 'settings' && pricingError && <div className={styles.errorBox}>{pricingError === 'AUTH_REQUIRED' ? t('auth.session_expired') : pricingError}</div>}
             {activeTab === 'settings' && apiKeySettingsError && <div className={styles.errorBox}>{apiKeySettingsError}</div>}
-            {!(activeTab === 'overview' ? error : activeTab === 'settings' ? (pricingError || apiKeySettingsError) : '') && statusError && <div className={styles.errorBox}>{statusError}</div>}
+            {!(activeTab === 'overview' ? error : activeTab === 'settings' ? (pricingError || apiKeySettingsError) : '') && displayStatusError && <div className={styles.errorBox}>{displayStatusError}</div>}
 
             {activeTab === 'overview' && (
               <>
@@ -1528,7 +1747,6 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
                   modelFilter={eventsModelFilter}
                   sourceFilter={eventsSourceFilter}
                   resultFilter={eventsResultFilter}
-                  modelPrices={modelPrices}
                   onPageChange={setEventsPage}
                   onPageSizeChange={handleEventsPageSizeChange}
                   onModelFilterChange={handleEventsModelFilterChange}
@@ -1538,34 +1756,50 @@ export function UsagePage({ onAuthRequired }: { onAuthRequired?: () => void }) {
               </>
             )}
 
-            {activeTab === 'credentials' && (
+            {credentialSectionVisibility.enabled && (
               <>
                 {credentialsData.error && <div className={styles.errorBox}>{credentialsData.error}</div>}
+                <CredentialProviderFilterBar
+                  scope={activeCredentialProviderFilterScope}
+                  typeCounts={credentialTypeCountsForProviderFilter}
+                  value={activeCredentialProviderFilter}
+                  onChange={setActiveCredentialProviderFilter}
+                />
                 <div className={styles.credentialsSections}>
-                  <AuthFileCredentialsSection
-                    rows={credentialsData.authFileRows}
-                    total={credentialsData.authFileTotal}
-                    page={credentialsData.authFilePage}
-                    totalPages={credentialsData.authFileTotalPages}
-                    pageSize={credentialsData.authFilePageSize}
-                    loading={credentialsData.loading}
-                    quotaRefreshing={credentialsData.quotaRefreshing}
-                    quotaRefreshError={credentialsData.quotaRefreshError}
-                    onPageChange={credentialsData.setAuthFilePage}
-                    onPageSizeChange={credentialsData.setAuthFilePageSize}
-                    onRefreshQuota={credentialsData.refreshQuotaForCurrentAuthFilePage}
-                    onRefreshQuotaForAuthIndex={credentialsData.refreshQuotaForAuthIndex}
-                  />
-                  <AiProviderCredentialsSection
-                    rows={credentialsData.aiProviderRows}
-                    total={credentialsData.aiProviderTotal}
-                    page={credentialsData.aiProviderPage}
-                    totalPages={credentialsData.aiProviderTotalPages}
-                    pageSize={credentialsData.aiProviderPageSize}
-                    loading={credentialsData.loading}
-                    onPageChange={credentialsData.setAiProviderPage}
-                    onPageSizeChange={credentialsData.setAiProviderPageSize}
-                  />
+                  {credentialSectionVisibility.showAuthFiles && (
+                    <AuthFileCredentialsSection
+                      rows={credentialsData.authFileRows}
+                      total={credentialsData.authFileTotal}
+                      page={credentialsData.authFilePage}
+                      totalPages={credentialsData.authFileTotalPages}
+                      pageSize={credentialsData.authFilePageSize}
+                      activeOnly={credentialsData.authFileActiveOnly}
+                      sort={credentialsData.authFileSort}
+                      loading={credentialsData.loading}
+                      quotaRefreshing={credentialsData.quotaRefreshing}
+                      quotaRefreshError={credentialsData.quotaRefreshError}
+                      onPageChange={credentialsData.setAuthFilePage}
+                      onPageSizeChange={credentialsData.setAuthFilePageSize}
+                      onActiveOnlyChange={credentialsData.setAuthFileActiveOnly}
+                      onSortChange={credentialsData.setAuthFileSort}
+                      onRefreshQuota={credentialsData.refreshQuotaForCurrentAuthFilePage}
+                      onRefreshQuotaForAuthIndex={credentialsData.refreshQuotaForAuthIndex}
+                    />
+                  )}
+                  {credentialSectionVisibility.showAiProvider && (
+                    <AiProviderCredentialsSection
+                      rows={credentialsData.aiProviderRows}
+                      total={credentialsData.aiProviderTotal}
+                      page={credentialsData.aiProviderPage}
+                      totalPages={credentialsData.aiProviderTotalPages}
+                      pageSize={credentialsData.aiProviderPageSize}
+                      sort={credentialsData.aiProviderSort}
+                      loading={credentialsData.loading}
+                      onPageChange={credentialsData.setAiProviderPage}
+                      onPageSizeChange={credentialsData.setAiProviderPageSize}
+                      onSortChange={credentialsData.setAiProviderSort}
+                    />
+                  )}
                 </div>
               </>
             )}

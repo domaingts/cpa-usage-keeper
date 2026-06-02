@@ -87,6 +87,34 @@ func TestFetchManagementAPIKeysRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestFetchAuthFilesParsesSyncMetadataFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != cpaManagementAuthFilesEndpoint {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"files":[{"auth_index":"codex-auth","type":"codex","prefix":"team","priority":7,"disabled":false,"note":"primary auth"},{"auth_index":"gemini-auth","type":"gemini"}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "management-secret", 2*time.Second, false)
+	result, err := client.FetchAuthFiles(context.Background())
+	if err != nil {
+		t.Fatalf("FetchAuthFiles returned error: %v", err)
+	}
+	if len(result.Payload.Files) != 2 {
+		t.Fatalf("expected two auth files, got %#v", result.Payload.Files)
+	}
+	file := result.Payload.Files[0]
+	if file.Prefix != "team" || file.Priority == nil || *file.Priority != 7 || file.Disabled == nil || *file.Disabled || file.Note == nil || *file.Note != "primary auth" {
+		t.Fatalf("expected sync metadata fields to decode, got %+v", file)
+	}
+	missing := result.Payload.Files[1]
+	if missing.Priority != nil || missing.Disabled != nil || missing.Note != nil || missing.Prefix != "" {
+		t.Fatalf("expected missing sync metadata fields to stay empty, got %+v", missing)
+	}
+}
+
 func TestFetchAuthFilesParsesCodexIDTokenFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != cpaManagementAuthFilesEndpoint {
@@ -152,9 +180,16 @@ func TestCallManagementAPIPostsWrappedRequest(t *testing.T) {
 		if !ok || header["Chatgpt-Account-Id"] != "acct_123" {
 			t.Fatalf("unexpected api-call header body: %#v", body["header"])
 		}
-		data, ok := body["data"].(map[string]any)
-		if !ok || data["project"] != "project-123" {
-			t.Fatalf("unexpected api-call data body: %#v", body["data"])
+		data, ok := body["data"].(string)
+		if !ok {
+			t.Fatalf("expected api-call data to be JSON string, got %#v", body["data"])
+		}
+		var decodedData map[string]string
+		if err := json.Unmarshal([]byte(data), &decodedData); err != nil {
+			t.Fatalf("decode api-call data string: %v", err)
+		}
+		if decodedData["project"] != "project-123" {
+			t.Fatalf("unexpected api-call data body: %#v", decodedData)
 		}
 
 		w.Header().Set("Content-Type", "application/json")

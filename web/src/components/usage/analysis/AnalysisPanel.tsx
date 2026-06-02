@@ -1,9 +1,9 @@
 import { useMemo, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { ChartData, ChartOptions, Plugin } from 'chart.js';
+import type { Chart, ChartData, ChartOptions, Plugin, TooltipModel } from 'chart.js';
 import { Bar, Doughnut } from 'react-chartjs-2';
 import type { AnalysisCompositionItem, AnalysisHeatmapCell, AnalysisResponse, AnalysisTokenUsageBucket } from '@/lib/types';
-import { formatCompactNumber } from '@/utils/usage';
+import { calculateDisplayInputTokens, calculateDisplayOutputTokens, formatCompactNumber } from '@/utils/usage';
 import styles from './AnalysisPanel.module.scss';
 
 interface AnalysisPanelProps {
@@ -17,8 +17,11 @@ type ChartRow = {
   label: string;
   input: number;
   output: number;
+  rawInput: number;
+  rawOutput: number;
   cached: number;
   reasoning: number;
+  total: number;
   requests: number;
 };
 
@@ -42,6 +45,10 @@ type GradientColor = {
   light: string;
 };
 
+type TokenTooltipDataset = ChartData<'bar', number[], string>['datasets'][number] & {
+  tooltipData?: number[];
+};
+
 const CHART_COLORS: GradientColor[] = [
   { base: '#1d4ed8', light: '#60a5fa' },
   { base: '#ca8a04', light: '#facc15' },
@@ -56,11 +63,15 @@ const TOKEN_COLORS = {
   reasoning: { base: '#8b5cf6', light: '#d8b4fe' },
   requests: '#ff5a40',
 };
+const COMPOSITION_TOOLTIP_ID = 'analysis-composition-tooltip';
+const COMPOSITION_TOOLTIP_MAX_WIDTH = 400;
+const COMPOSITION_TOOLTIP_VIEWPORT_PADDING = 8;
 type TokenLabels = {
   input: string;
   output: string;
   cached: string;
   reasoning: string;
+  total: string;
   requests: string;
 };
 
@@ -89,6 +100,21 @@ const getChartTheme = (isDark: boolean): ChartTheme => ({
 const toNumber = (value: unknown) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const getDatasetLabelPrefix = (dataset: unknown): string => {
+  const label = dataset && typeof dataset === 'object'
+    ? (dataset as { label?: unknown }).label
+    : undefined;
+  return typeof label === 'string' && label ? `${label}: ` : '';
+};
+
+const getTooltipTokenValue = (dataset: unknown, dataIndex: number | undefined, fallback: unknown): number => {
+  const tooltipData = dataset && typeof dataset === 'object'
+    ? (dataset as { tooltipData?: unknown[] }).tooltipData
+    : undefined;
+  const tooltipValue = typeof dataIndex === 'number' ? tooltipData?.[dataIndex] : undefined;
+  return toNumber(tooltipValue ?? fallback);
 };
 
 const createChartGradient = (ctx: CanvasRenderingContext2D, chartArea: { top: number; bottom: number }, color: GradientColor) => {
@@ -122,6 +148,19 @@ const getHeatmapCellGradient = (intensity: number) => {
   return `linear-gradient(180deg, rgb(${top.join(', ')}) 0%, rgb(${bottom.join(', ')}) 100%)`;
 };
 
+const getHeatmapCellTextColor = (intensity: number) => {
+  const clampedIntensity = Math.max(0, Math.min(1, intensity));
+  const color = interpolateColor([107, 71, 35], [48, 24, 16], clampedIntensity);
+  const opacity = 0.58 + clampedIntensity * 0.28;
+  return `rgba(${color.join(', ')}, ${opacity})`;
+};
+
+const getHeatmapVisualIntensity = (value: number, maxValue: number) => {
+  if (value <= 0 || maxValue <= 0) return 0;
+  const rawIntensity = value / maxValue;
+  return 0.05 + 0.95 * Math.pow(rawIntensity, 0.65);
+};
+
 const formatBucketLabel = (bucket: string, granularity: AnalysisResponse['granularity']) => {
   const date = new Date(bucket);
   if (Number.isNaN(date.getTime())) return bucket;
@@ -134,10 +173,19 @@ const formatBucketLabel = (bucket: string, granularity: AnalysisResponse['granul
 function buildTokenUsageRows(buckets: AnalysisTokenUsageBucket[], granularity: AnalysisResponse['granularity']): ChartRow[] {
   return buckets.map((bucket) => ({
     label: formatBucketLabel(bucket.bucket, granularity),
-    input: toNumber(bucket.input_tokens),
-    output: toNumber(bucket.output_tokens),
+    input: calculateDisplayInputTokens({
+      inputTokens: bucket.input_tokens,
+      cachedTokens: bucket.cached_tokens,
+    }),
+    output: calculateDisplayOutputTokens({
+      outputTokens: bucket.output_tokens,
+      reasoningTokens: bucket.reasoning_tokens,
+    }),
+    rawInput: toNumber(bucket.input_tokens),
+    rawOutput: toNumber(bucket.output_tokens),
     cached: toNumber(bucket.cached_tokens),
     reasoning: toNumber(bucket.reasoning_tokens),
+    total: toNumber(bucket.total_tokens),
     requests: toNumber(bucket.requests),
   }));
 }
@@ -175,7 +223,7 @@ function buildTokenLegendItems(labels: TokenLabels): LegendItem[] {
   ];
 }
 
-function buildAnalysisTokenChartOptions({ chartTheme, isMobile }: { chartTheme: ChartTheme; isMobile: boolean }): ChartOptions<'bar'> {
+function buildAnalysisTokenChartOptions({ chartTheme, isMobile, totalTokens, totalLabel }: { chartTheme: ChartTheme; isMobile: boolean; totalTokens: number[]; totalLabel: string }): ChartOptions<'bar'> {
   return {
     responsive: true,
     maintainAspectRatio: false,
@@ -193,8 +241,14 @@ function buildAnalysisTokenChartOptions({ chartTheme, isMobile }: { chartTheme: 
         usePointStyle: true,
         callbacks: {
           label: (context) => {
-            const label = context.dataset.label ? `${context.dataset.label}: ` : '';
-            return `${label}${formatCompactNumber(Number(context.parsed.y ?? 0))}`;
+            const label = getDatasetLabelPrefix(context.dataset);
+            const value = getTooltipTokenValue(context.dataset, context.dataIndex, context.parsed.y);
+            return `${label}${formatCompactNumber(value)}`;
+          },
+          footer: (items) => {
+            const dataIndex = items[0]?.dataIndex ?? -1;
+            if (dataIndex < 0) return '';
+            return `${totalLabel}: ${formatCompactNumber(Number(totalTokens[dataIndex] ?? 0))}`;
           },
         },
       },
@@ -232,10 +286,10 @@ function buildAnalysisTokenChartData(rows: ChartRow[], labels: TokenLabels): Cha
   return {
     labels: rows.map((row) => row.label),
     datasets: [
-      { label: labels.input, data: rows.map((row) => row.input), backgroundColor: (context) => toGradientFill(context, tokenColors.input), borderColor: tokenColors.input.base, stack: 'tokens', yAxisID: 'tokens' },
-      { label: labels.output, data: rows.map((row) => row.output), backgroundColor: (context) => toGradientFill(context, tokenColors.output), borderColor: tokenColors.output.base, stack: 'tokens', yAxisID: 'tokens' },
-      { label: labels.cached, data: rows.map((row) => row.cached), backgroundColor: (context) => toGradientFill(context, tokenColors.cached), borderColor: tokenColors.cached.base, stack: 'tokens', yAxisID: 'tokens' },
-      { label: labels.reasoning, data: rows.map((row) => row.reasoning), backgroundColor: (context) => toGradientFill(context, tokenColors.reasoning), borderColor: tokenColors.reasoning.base, stack: 'tokens', yAxisID: 'tokens' },
+      { label: labels.input, data: rows.map((row) => row.input), tooltipData: rows.map((row) => row.rawInput), backgroundColor: (context) => toGradientFill(context, tokenColors.input), borderColor: tokenColors.input.base, stack: 'tokens', yAxisID: 'tokens' } as TokenTooltipDataset,
+      { label: labels.output, data: rows.map((row) => row.output), tooltipData: rows.map((row) => row.rawOutput), backgroundColor: (context) => toGradientFill(context, tokenColors.output), borderColor: tokenColors.output.base, stack: 'tokens', yAxisID: 'tokens' } as TokenTooltipDataset,
+      { label: labels.cached, data: rows.map((row) => row.cached), tooltipData: rows.map((row) => row.cached), backgroundColor: (context) => toGradientFill(context, tokenColors.cached), borderColor: tokenColors.cached.base, stack: 'tokens', yAxisID: 'tokens' } as TokenTooltipDataset,
+      { label: labels.reasoning, data: rows.map((row) => row.reasoning), tooltipData: rows.map((row) => row.reasoning), backgroundColor: (context) => toGradientFill(context, tokenColors.reasoning), borderColor: tokenColors.reasoning.base, stack: 'tokens', yAxisID: 'tokens' } as TokenTooltipDataset,
       {
         type: 'line',
         label: labels.requests,
@@ -266,6 +320,70 @@ function buildCompositionChartData(items: AnalysisCompositionItem[]): ChartData<
   };
 }
 
+function getCompositionTooltipElement() {
+  let tooltipEl = document.getElementById(COMPOSITION_TOOLTIP_ID) as HTMLDivElement | null;
+  if (tooltipEl) return tooltipEl;
+  tooltipEl = document.createElement('div');
+  tooltipEl.id = COMPOSITION_TOOLTIP_ID;
+  document.body.appendChild(tooltipEl);
+  return tooltipEl;
+}
+
+function createCompositionTooltipHandler(chartTheme: ChartTheme): (args: { chart: Chart; tooltip: TooltipModel<'doughnut'> }) => void {
+  return ({ chart, tooltip }) => {
+    if (typeof document === 'undefined') return;
+    const tooltipEl = getCompositionTooltipElement();
+    if (tooltip.opacity === 0) {
+      tooltipEl.style.opacity = '0';
+      return;
+    }
+
+    tooltipEl.replaceChildren();
+    const title = document.createElement('div');
+    title.textContent = tooltip.title.join(' ');
+    title.style.color = chartTheme.textPrimary;
+    title.style.fontWeight = '800';
+    title.style.marginBottom = '4px';
+    tooltipEl.appendChild(title);
+
+    for (const bodyItem of tooltip.body) {
+      for (const line of bodyItem.lines) {
+        const body = document.createElement('div');
+        body.textContent = line;
+        body.style.color = chartTheme.tooltipBody;
+        tooltipEl.appendChild(body);
+      }
+    }
+
+    const viewportWidth = window.innerWidth;
+    const maxWidth = Math.min(COMPOSITION_TOOLTIP_MAX_WIDTH, viewportWidth - COMPOSITION_TOOLTIP_VIEWPORT_PADDING * 2);
+    tooltipEl.style.position = 'fixed';
+    tooltipEl.style.zIndex = '1000';
+    tooltipEl.style.pointerEvents = 'none';
+    tooltipEl.style.opacity = '1';
+    tooltipEl.style.maxWidth = `${maxWidth}px`;
+    tooltipEl.style.padding = '10px 12px';
+    tooltipEl.style.border = `1px solid ${chartTheme.tooltipBorder}`;
+    tooltipEl.style.borderRadius = '12px';
+    tooltipEl.style.background = chartTheme.tooltipBg;
+    tooltipEl.style.boxShadow = '0 16px 36px rgba(0, 0, 0, 0.18)';
+    tooltipEl.style.font = '12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    tooltipEl.style.lineHeight = '1.35';
+    tooltipEl.style.whiteSpace = 'normal';
+    tooltipEl.style.overflowWrap = 'anywhere';
+
+    const canvasRect = chart.canvas.getBoundingClientRect();
+    const tooltipWidth = tooltipEl.offsetWidth;
+    const tooltipHeight = tooltipEl.offsetHeight;
+    const rawLeft = canvasRect.left + tooltip.caretX - tooltipWidth / 2;
+    const left = Math.max(COMPOSITION_TOOLTIP_VIEWPORT_PADDING, Math.min(rawLeft, viewportWidth - tooltipWidth - COMPOSITION_TOOLTIP_VIEWPORT_PADDING));
+    const topAbove = canvasRect.top + tooltip.caretY - tooltipHeight - 12;
+    const top = topAbove >= COMPOSITION_TOOLTIP_VIEWPORT_PADDING ? topAbove : canvasRect.top + tooltip.caretY + 12;
+    tooltipEl.style.left = `${left}px`;
+    tooltipEl.style.top = `${top}px`;
+  };
+}
+
 function buildCompositionChartOptions(chartTheme: ChartTheme): ChartOptions<'doughnut'> {
   return {
     responsive: true,
@@ -274,6 +392,8 @@ function buildCompositionChartOptions(chartTheme: ChartTheme): ChartOptions<'dou
     plugins: {
       legend: { display: false },
       tooltip: {
+        enabled: false,
+        external: createCompositionTooltipHandler(chartTheme),
         backgroundColor: chartTheme.tooltipBg,
         titleColor: chartTheme.textPrimary,
         bodyColor: chartTheme.tooltipBody,
@@ -283,7 +403,7 @@ function buildCompositionChartOptions(chartTheme: ChartTheme): ChartOptions<'dou
         displayColors: true,
         usePointStyle: true,
         callbacks: {
-          label: (context) => `${context.label}: ${formatCompactNumber(Number(context.parsed ?? 0))}`,
+          label: (context) => formatCompactNumber(Number(context.parsed ?? 0)),
         },
       },
     },
@@ -297,11 +417,17 @@ function TokenUsageChart({ rows, loading, isDark, isMobile }: { rows: ChartRow[]
     output: t('usage_stats.output_tokens'),
     cached: t('usage_stats.cached_tokens'),
     reasoning: t('usage_stats.reasoning_tokens'),
+    total: t('usage_stats.total_tokens'),
     requests: t('usage_stats.requests_count'),
   }), [t]);
   const chartTheme = useMemo(() => getChartTheme(isDark), [isDark]);
   const chartData = useMemo(() => buildAnalysisTokenChartData(rows, tokenLabels), [rows, tokenLabels]);
-  const chartOptions = useMemo(() => buildAnalysisTokenChartOptions({ chartTheme, isMobile }), [chartTheme, isMobile]);
+  const chartOptions = useMemo(() => buildAnalysisTokenChartOptions({
+    chartTheme,
+    isMobile,
+    totalTokens: rows.map((row) => row.total),
+    totalLabel: tokenLabels.total,
+  }), [chartTheme, isMobile, rows, tokenLabels.total]);
   const legendItems = useMemo(() => buildTokenLegendItems(tokenLabels), [tokenLabels]);
   return (
     <section className={`${styles.analysisCard} ${styles.tokenUsageCard}`}>
@@ -376,6 +502,7 @@ function CompositionDonutChart({ title, items, loading, isDark }: { title: strin
 function Heatmap({ cells, apiKeys, models, loading }: { cells: AnalysisHeatmapCell[]; apiKeys: string[]; models: string[]; loading: boolean }) {
   const { t } = useTranslation();
   const cellMap = useMemo(() => new Map(cells.map((cell) => [`${cell.api_key}\0${cell.model}`, cell])), [cells]);
+  const maxHeatmapTokens = useMemo(() => Math.max(0, ...cells.map((cell) => toNumber(cell.total_tokens))), [cells]);
   return (
     <section className={`${styles.analysisCard} ${styles.heatmapCard}`}>
       <div className={styles.cardHeader}>
@@ -406,19 +533,27 @@ function Heatmap({ cells, apiKeys, models, loading }: { cells: AnalysisHeatmapCe
                     </div>
                     {models.map((model) => {
                       const cell = cellMap.get(`${apiKey}\0${model}`);
-                      const intensity = Math.max(0, Math.min(1, toNumber(cell?.intensity)));
+                      const heatmapTokens = toNumber(cell?.total_tokens);
+                      const heatmapRequests = toNumber(cell?.requests);
+                      const intensity = getHeatmapVisualIntensity(heatmapTokens, maxHeatmapTokens);
                       return (
                         <div
                           key={`${apiKey}-${model}`}
                           className={styles.heatmapCell}
-                          style={{ background: getHeatmapCellGradient(intensity) } as CSSProperties}
+                          style={{ background: getHeatmapCellGradient(intensity), color: getHeatmapCellTextColor(intensity) } as CSSProperties}
                           title={t('usage_stats.analysis_heatmap_cell_title', {
-                            apiKey,
                             model,
-                            tokens: formatCompactNumber(toNumber(cell?.total_tokens)),
-                            requests: formatCompactNumber(toNumber(cell?.requests)),
+                            tokens: formatCompactNumber(heatmapTokens),
+                            requests: formatCompactNumber(heatmapRequests),
                           })}
-                        />
+                        >
+                          <span className={styles.heatmapCellTokenValue}>
+                            {t('usage_stats.analysis_heatmap_tokens_prefix')}: {formatCompactNumber(heatmapTokens)}
+                          </span>
+                          <span className={styles.heatmapCellRequestValue}>
+                            {t('usage_stats.analysis_heatmap_requests_prefix')}: {formatCompactNumber(heatmapRequests)}
+                          </span>
+                        </div>
                       );
                     })}
                   </div>
@@ -442,6 +577,8 @@ export function AnalysisPanel({ analysis, loading, isDark, isMobile }: AnalysisP
   const tokenRows = useMemo(() => buildTokenUsageRows(analysis?.token_usage ?? [], analysis?.granularity ?? 'hourly'), [analysis]);
   const apiComposition = useMemo(() => takeMajorComposition(analysis?.api_key_composition ?? [], t('usage_stats.analysis_others')), [analysis, t]);
   const modelComposition = useMemo(() => takeMajorComposition(analysis?.model_composition ?? [], t('usage_stats.analysis_others')), [analysis, t]);
+  const authFilesComposition = useMemo(() => takeMajorComposition(analysis?.auth_files_composition ?? [], t('usage_stats.analysis_others')), [analysis, t]);
+  const aiProviderComposition = useMemo(() => takeMajorComposition(analysis?.ai_provider_composition ?? [], t('usage_stats.analysis_others')), [analysis, t]);
 
   return (
     <div className={styles.analysisPanel}>
@@ -449,6 +586,8 @@ export function AnalysisPanel({ analysis, loading, isDark, isMobile }: AnalysisP
       <div className={styles.compositionGrid}>
         <CompositionDonutChart title={t('usage_stats.analysis_api_key_composition_title')} items={apiComposition} loading={loading} isDark={isDark} />
         <CompositionDonutChart title={t('usage_stats.analysis_model_composition_title')} items={modelComposition} loading={loading} isDark={isDark} />
+        <CompositionDonutChart title={t('usage_stats.analysis_auth_files_composition_title')} items={authFilesComposition} loading={loading} isDark={isDark} />
+        <CompositionDonutChart title={t('usage_stats.analysis_ai_provider_composition_title')} items={aiProviderComposition} loading={loading} isDark={isDark} />
       </div>
       <Heatmap cells={analysis?.heatmap.cells ?? []} apiKeys={analysis?.heatmap.api_keys ?? []} models={analysis?.heatmap.models ?? []} loading={loading} />
     </div>
