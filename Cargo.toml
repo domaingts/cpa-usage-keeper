@@ -1,0 +1,84 @@
+[package]
+name = "cpa-usage-keeper"
+version = "1.6.0"
+edition = "2024"
+
+[[bin]]
+name = "cpa-usage-keeper"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP server (Phase 11)
+axum = { version = "0.7", features = ["macros", "http2"] }
+axum-extra = { version = "0.9", features = ["cookie"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "fs", "compression-gzip"] }
+hyper = { version = "1", features = ["full"] }
+
+# HTTP client (Phase 6)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "stream", "gzip"] }
+
+# Database (Phase 3-4)
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "sqlite", "chrono", "macros", "migrate"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "chrono"] }
+tracing-appender = "0.2"
+
+# Config / env
+dotenvy = "0.15"
+
+# Crypto / auth
+rand = "0.8"
+hex = "0.4"
+subtle = "2"
+sha2 = "0.10"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Static assets (Phase 11)
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+
+# Utilities
+url = "2"
+regex = "1"
+once_cell = "1"
+parking_lot = "0.12"
+
+# TLS for raw Redis RESP (Phase 6)
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
+
+# Backup (Phase 5)
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
